@@ -1,0 +1,19 @@
+# AnyConnect Split Tunnel Configuration
+
+# Original gateway (auto-detected, saved here for recovery)
+original_gateway: ""
+
+# Enable/disable split tunneling
+split_tunnel_enabled: true
+
+# Start with Windows
+auto_start: false
+
+# IP database update interval (days)
+update_interval_days: 7
+
+# Last IP database update time
+last_update: "0001-01-01T00:00:00Z"
+
+# Log level: debug, info, warn, error
+log_level: "info"
