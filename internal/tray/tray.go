@@ -19,12 +19,26 @@ type Actions struct {
 	OnUpdateIPDB    func()
 	OnViewLog       func()
 	OnToggleAuto    func(enabled bool) error
+	OnOpenDashboard func()
+	OnContactAuthor func()
 	OnQuit          func()
+}
+
+type Status struct {
+	StatusText   string
+	CurrentSite  string
+	RouteCount   int
+	SplitEnabled bool
+	AutoStart    bool
+	LastError    string
 }
 
 type Tray struct {
 	actionsMu         sync.RWMutex
 	actions           Actions
+	statusMu          sync.RWMutex
+	status            Status
+	statusListener    func(Status)
 	menuStatus        *systray.MenuItem
 	menuSite          *systray.MenuItem
 	menuDisconnect    *systray.MenuItem
@@ -50,7 +64,12 @@ func New(actions Actions, splitEnabled bool, autoStart bool) *Tray {
 		actions:      actions,
 		splitEnabled: splitEnabled,
 		autoStart:    autoStart,
-		ready:        make(chan struct{}),
+		status: Status{
+			StatusText:   "状态：VPN 未连接",
+			SplitEnabled: splitEnabled,
+			AutoStart:    autoStart,
+		},
+		ready: make(chan struct{}),
 	}
 }
 
@@ -70,6 +89,32 @@ func (t *Tray) getActions() Actions {
 	t.actionsMu.RLock()
 	defer t.actionsMu.RUnlock()
 	return t.actions
+}
+
+func (t *Tray) SetStatusListener(listener func(Status)) {
+	t.statusMu.Lock()
+	t.statusListener = listener
+	status := t.status
+	t.statusMu.Unlock()
+	if listener != nil {
+		listener(status)
+	}
+}
+
+func (t *Tray) SetStatusFields(text string, routeCount int, lastError string) {
+	t.statusMu.Lock()
+	t.status.StatusText = text
+	t.status.CurrentSite = t.currentSite
+	t.status.RouteCount = routeCount
+	t.status.SplitEnabled = t.splitEnabled
+	t.status.AutoStart = t.autoStart
+	t.status.LastError = lastError
+	listener := t.statusListener
+	status := t.status
+	t.statusMu.Unlock()
+	if listener != nil {
+		listener(status)
+	}
 }
 
 func (t *Tray) Run() {
@@ -127,6 +172,19 @@ func (t *Tray) onReady() {
 
 	log.Println("Tray initialized successfully")
 	t.refreshSiteDisplay()
+
+	if a := t.getActions(); a.OnOpenDashboard != nil {
+		systray.SetIconClickHandler(func(left bool) {
+			button := IconButtonLeft
+			switch ResolveIconClickAction(button, true) {
+			case IconClickOpenDashboard:
+				a := t.getActions()
+				if a.OnOpenDashboard != nil {
+					a.OnOpenDashboard()
+				}
+			}
+		})
+	}
 
 	go t.handleClicks()
 	go t.handleContactAuthorClicks()
@@ -215,8 +273,12 @@ func (t *Tray) handleClicks() {
 
 func (t *Tray) handleContactAuthorClicks() {
 	for range t.menuContactAuthor.ClickedCh {
-		script := `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show("作者：卓哥` + "`n" + `微信号：ai_creater99` + "`n`n" + `有任何优化或定制需求，欢迎找卓哥~", "联系作者", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)`
-		exec.Command("powershell", "-NoProfile", "-Command", script).Start()
+		a := t.getActions()
+		if a.OnContactAuthor != nil {
+			a.OnContactAuthor()
+			continue
+		}
+		ShowContactAuthor()
 	}
 }
 
@@ -260,6 +322,16 @@ func (t *Tray) tooltip(state string) string {
 
 func (t *Tray) refreshSiteDisplay() {
 	site := t.siteLabel()
+	t.statusMu.Lock()
+	t.status.CurrentSite = strings.TrimSpace(t.currentSite)
+	t.status.SplitEnabled = t.splitEnabled
+	t.status.AutoStart = t.autoStart
+	listener := t.statusListener
+	status := t.status
+	t.statusMu.Unlock()
+	if listener != nil {
+		listener(status)
+	}
 	if t.menuSite != nil {
 		t.menuSite.SetTitle("当前站点：" + site)
 		t.menuSite.SetTooltip("当前 VPN 站点：" + site)
@@ -290,58 +362,119 @@ func (t *Tray) ClearCurrentSite() {
 	t.SetCurrentSite("")
 }
 
+func (t *Tray) SetSplitEnabled(enabled bool) {
+	t.splitEnabled = enabled
+	if t.menuToggle != nil {
+		if enabled {
+			t.menuToggle.Check()
+		} else {
+			t.menuToggle.Uncheck()
+		}
+	}
+	t.refreshSiteDisplay()
+}
+
+func (t *Tray) SetAutoStartEnabled(enabled bool) {
+	t.autoStart = enabled
+	if t.menuAutoStart != nil {
+		if enabled {
+			t.menuAutoStart.Check()
+		} else {
+			t.menuAutoStart.Uncheck()
+		}
+	}
+	t.refreshSiteDisplay()
+}
+
 func (t *Tray) SetStatusIdle() {
-	systray.SetIcon(iconIdle)
-	systray.SetTooltip(t.tooltip("VPN 未连接"))
-	t.menuStatus.SetTitle("状态：VPN 未连接")
+	title := "状态：VPN 未连接"
+	t.SetStatusFields(title, 0, "")
+	if t.menuStatus != nil {
+		systray.SetIcon(iconIdle)
+		systray.SetTooltip(t.tooltip("VPN 未连接"))
+		t.menuStatus.SetTitle(title)
+	}
 	t.refreshSiteDisplay()
 }
 
 func (t *Tray) SetStatusActive(routeCount int) {
-	systray.SetIcon(iconActive)
-	systray.SetTooltip(t.tooltip("VPN 已连接"))
-	t.menuStatus.SetTitle(fmt.Sprintf("状态：分流已启用（%d 条路由）", routeCount))
+	title := fmt.Sprintf("状态：分流已启用（%d 条路由）", routeCount)
+	t.SetStatusFields(title, routeCount, "")
+	if t.menuStatus != nil {
+		systray.SetIcon(iconActive)
+		systray.SetTooltip(t.tooltip("VPN 已连接"))
+		t.menuStatus.SetTitle(title)
+	}
 	t.refreshSiteDisplay()
 }
 
 func (t *Tray) SetStatusTunActive() {
-	systray.SetIcon(iconActive)
-	systray.SetTooltip(t.tooltip("TUN 分流已启用"))
-	t.menuStatus.SetTitle("状态：TUN 分流已启用")
+	title := "状态：TUN 分流已启用"
+	t.SetStatusFields(title, 0, "")
+	if t.menuStatus != nil {
+		systray.SetIcon(iconActive)
+		systray.SetTooltip(t.tooltip("TUN 分流已启用"))
+		t.menuStatus.SetTitle(title)
+	}
 	t.refreshSiteDisplay()
 }
 
 func (t *Tray) SetStatusTunFullTunnel() {
-	systray.SetIcon(iconActive)
-	systray.SetTooltip(t.tooltip("TUN 全隧道已启用"))
-	t.menuStatus.SetTitle("状态：TUN 全隧道已启用")
+	title := "状态：TUN 全隧道已启用"
+	t.SetStatusFields(title, 0, "")
+	if t.menuStatus != nil {
+		systray.SetIcon(iconActive)
+		systray.SetTooltip(t.tooltip("TUN 全隧道已启用"))
+		t.menuStatus.SetTitle(title)
+	}
 	t.refreshSiteDisplay()
 }
 
 func (t *Tray) SetStatusStaticFallback(routeCount int) {
-	systray.SetIcon(iconActive)
-	systray.SetTooltip(t.tooltip("已回退静态路由"))
-	t.menuStatus.SetTitle(fmt.Sprintf("状态：已回退静态路由（%d 条路由）", routeCount))
+	title := fmt.Sprintf("状态：已回退静态路由（%d 条路由）", routeCount)
+	t.SetStatusFields(title, routeCount, "")
+	if t.menuStatus != nil {
+		systray.SetIcon(iconActive)
+		systray.SetTooltip(t.tooltip("已回退静态路由"))
+		t.menuStatus.SetTitle(title)
+	}
 	t.refreshSiteDisplay()
 }
 
 func (t *Tray) SetStatusSplitDisabled() {
-	systray.SetIcon(iconIdle)
-	systray.SetTooltip(t.tooltip("分流未启用"))
-	t.menuStatus.SetTitle("状态：VPN 已连接，分流未启用")
+	title := "状态：VPN 已连接，分流未启用"
+	t.SetStatusFields(title, 0, "")
+	if t.menuStatus != nil {
+		systray.SetIcon(iconIdle)
+		systray.SetTooltip(t.tooltip("分流未启用"))
+		t.menuStatus.SetTitle(title)
+	}
 	t.refreshSiteDisplay()
 }
 
 func (t *Tray) SetStatusBusy(msg string) {
-	systray.SetIcon(iconBusy)
-	systray.SetTooltip(t.tooltip("处理中..."))
-	t.menuStatus.SetTitle(fmt.Sprintf("状态：%s", msg))
+	title := fmt.Sprintf("状态：%s", msg)
+	t.SetStatusFields(title, 0, "")
+	if t.menuStatus != nil {
+		systray.SetIcon(iconBusy)
+		systray.SetTooltip(t.tooltip("处理中..."))
+		t.menuStatus.SetTitle(title)
+	}
 	t.refreshSiteDisplay()
 }
 
 func (t *Tray) SetStatusError(msg string) {
-	systray.SetIcon(iconError)
-	systray.SetTooltip(t.tooltip("出错"))
-	t.menuStatus.SetTitle(fmt.Sprintf("错误：%s", msg))
+	title := fmt.Sprintf("错误：%s", msg)
+	t.SetStatusFields(title, 0, msg)
+	if t.menuStatus != nil {
+		systray.SetIcon(iconError)
+		systray.SetTooltip(t.tooltip("出错"))
+		t.menuStatus.SetTitle(title)
+	}
 	t.refreshSiteDisplay()
+}
+
+func ShowContactAuthor() {
+	script := `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show("作者：卓哥` + "`n" + `微信号：ai_creater99` + "`n`n" + `有任何优化或定制需求，欢迎找卓哥~", "联系作者", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)`
+	exec.Command("powershell", "-NoProfile", "-Command", script).Start()
 }

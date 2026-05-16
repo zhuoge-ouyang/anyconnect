@@ -14,10 +14,16 @@ import (
 )
 
 const (
-	iconSize = 32
-	outFile  = `internal/tray/icon_data.go`
-	srcFile  = `internal/tray/vpn_icon.png`
-	icoFile  = `internal/tray/app.ico`
+	iconSize            = 32
+	outFile             = `internal/tray/icon_data.go`
+	srcFile             = `internal/tray/vpn_icon.png`
+	icoFile             = `internal/tray/app.ico`
+	cmdIconICOFile      = `cmd/winres/icon.ico`
+	cmdIconPNGFile      = `cmd/winres/icon.png`
+	cmdIconSmallPNGFile = `cmd/winres/icon16.png`
+	installerICOFile    = `cmd/installer/winres/icon.ico`
+	installerPNGFile    = `cmd/installer/winres/icon.png`
+	installerSmallFile  = `cmd/installer/winres/icon16.png`
 )
 
 func main() {
@@ -56,6 +62,24 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Failed to write app ICO: %v\n", err)
 		os.Exit(1)
 	}
+	for _, path := range []string{cmdIconICOFile, installerICOFile} {
+		if err := os.WriteFile(path, appICO, 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to write %s: %v\n", path, err)
+			os.Exit(1)
+		}
+	}
+	for _, path := range []string{cmdIconPNGFile, installerPNGFile} {
+		if err := writeScaledPNG(path, srcImg, 256); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to write %s: %v\n", path, err)
+			os.Exit(1)
+		}
+	}
+	for _, path := range []string{cmdIconSmallPNGFile, installerSmallFile} {
+		if err := writeScaledPNG(path, srcImg, 32); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to write %s: %v\n", path, err)
+			os.Exit(1)
+		}
+	}
 
 	// Write Go source
 	out, err := os.Create(outFile)
@@ -81,6 +105,17 @@ func main() {
 	writeVar(out, "AppIcon", appICO)
 
 	fmt.Println("icon_data.go generated successfully.")
+}
+
+func writeScaledPNG(path string, src image.Image, size int) error {
+	dst := image.NewRGBA(image.Rect(0, 0, size, size))
+	draw.CatmullRom.Scale(dst, dst.Bounds(), src, src.Bounds(), draw.Over, nil)
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return png.Encode(f, dst)
 }
 
 func writeVar(f *os.File, name string, data []byte) {

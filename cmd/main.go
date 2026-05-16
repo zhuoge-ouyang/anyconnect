@@ -22,6 +22,7 @@ import (
 	"github.com/user/anyconnect-split/internal/codexprobe"
 	"github.com/user/anyconnect-split/internal/config"
 	"github.com/user/anyconnect-split/internal/credential"
+	"github.com/user/anyconnect-split/internal/dashboard"
 	"github.com/user/anyconnect-split/internal/domainroute"
 	"github.com/user/anyconnect-split/internal/ipdb"
 	"github.com/user/anyconnect-split/internal/monitor"
@@ -33,6 +34,8 @@ import (
 )
 
 const credentialTarget = "AnyConnectSplitTunnel"
+const desktopShortcutName = "分流守卫.lnk"
+const legacyDesktopShortcutName = "Split Tunnel.lnk"
 
 var (
 	modUser32       = windows.NewLazySystemDLL("user32.dll")
@@ -68,7 +71,16 @@ func ensureSingleInstance() {
 
 func ensureDesktopShortcut(ctx context.Context) {
 	desktop := filepath.Join(os.Getenv("USERPROFILE"), "Desktop")
-	shortcut := filepath.Join(desktop, "Split Tunnel.lnk")
+	shortcut := filepath.Join(desktop, desktopShortcutName)
+	legacyShortcut := filepath.Join(desktop, legacyDesktopShortcutName)
+	if _, err := os.Stat(shortcut); os.IsNotExist(err) {
+		if _, legacyErr := os.Stat(legacyShortcut); legacyErr == nil {
+			if renameErr := os.Rename(legacyShortcut, shortcut); renameErr != nil {
+				log.Printf("Legacy desktop shortcut rename failed: %v", renameErr)
+				shortcut = legacyShortcut
+			}
+		}
+	}
 	if _, err := os.Stat(shortcut); err == nil {
 		updateShortcutIcon(ctx, shortcut)
 		return // 已存在
@@ -460,7 +472,45 @@ func main() {
 	}
 
 	dataDir := filepath.Join(baseDir(), "data")
+	dashboardStore := dashboard.NewStore(dataDir)
+	dashboardController := dashboard.NewController(dashboardStore, dashboard.Actions{})
+	dashboardBackend := func() string { return "" }
+	dashboardRouteCount := func() int { return 0 }
+	publishDashboard := func(status tray.Status) {
+		routeCount := status.RouteCount
+		if routeCount == 0 {
+			routeCount = dashboardRouteCount()
+		}
+		backend := dashboardBackend()
+		if backend == "" {
+			backend = "未连接"
+		}
+		if err := dashboardController.UpdateSnapshot(dashboard.Snapshot{
+			StatusText:          status.StatusText,
+			CurrentSite:         status.CurrentSite,
+			SplitTunnelEnabled:  status.SplitEnabled,
+			AutoStartEnabled:    status.AutoStart,
+			Backend:             backend,
+			RouteCount:          routeCount,
+			LastIPDBUpdate:      cfg.LastUpdate,
+			OriginalGateway:     cfg.OriginalGateway,
+			OriginalInterface:   cfg.OriginalInterfaceIndex,
+			OriginalIPv6Gateway: cfg.OriginalIPv6Gateway,
+			OriginalIPv6IfIndex: cfg.OriginalIPv6Interface,
+			IPv6SplitEnabled:    cfg.IPv6SplitEnabled,
+			LastError:           status.LastError,
+		}); err != nil {
+			log.Printf("Failed to write dashboard snapshot: %v", err)
+		}
+	}
+	showDashboard := func() {
+		if err := ui.ShowDashboard(dashboardStore, filepath.Join(baseDir(), "app.ico")); err != nil {
+			log.Printf("Failed to show dashboard: %v", err)
+		}
+	}
 	trayUI := tray.New(tray.Actions{
+		OnOpenDashboard: showDashboard,
+		OnContactAuthor: tray.ShowContactAuthor,
 		OnQuit: func() {
 			log.Println("Quitting (early)...")
 			os.Exit(0)
@@ -469,6 +519,7 @@ func main() {
 			exec.Command("notepad", logFile).Start()
 		},
 	}, cfg.SplitTunnelEnabled, cfg.AutoStart)
+	trayUI.SetStatusListener(publishDashboard)
 	trayUI.SetInitialTooltip("AnyConnect Split Tunnel - 初始化中...")
 	go func() {
 		trayUI.Run()
@@ -624,6 +675,7 @@ func main() {
 		defer sessionMu.Unlock()
 		return activeBackend
 	}
+	dashboardBackend = currentBackend
 	usingTun := func() bool {
 		return currentBackend() == config.TrafficBackendOpenTun
 	}
@@ -765,6 +817,7 @@ func main() {
 		cfg.OriginalIPv6Interface,
 		dataDir,
 	)
+	dashboardRouteCount = routeMgr.GetAppliedRouteCount
 	// 注意：CleanupStaleRoutes 移至 tray 启动后异步执行，避免阻塞主 goroutine
 
 	// 10. 初始化 VPN 监控
@@ -1165,6 +1218,7 @@ func main() {
 			restoreNormalSite("restore normal")
 		},
 		OnToggleSplit: func(enabled bool) {
+			trayUI.SetSplitEnabled(enabled)
 			cfg.SplitTunnelEnabled = enabled
 			cfg.Save()
 			if usingTun() {
@@ -1234,9 +1288,12 @@ func main() {
 				return err
 			}
 			cfg.AutoStart = enabled
+			trayUI.SetAutoStartEnabled(enabled)
 			cfg.Save()
 			return nil
 		},
+		OnOpenDashboard: showDashboard,
+		OnContactAuthor: tray.ShowContactAuthor,
 		OnQuit: func() {
 			log.Println("Quitting application...")
 			if trayUI != nil {
@@ -1262,6 +1319,52 @@ func main() {
 	// Update tray with full actions (now that all dependencies are ready)
 	trayUI.SetActions(actions)
 	trayUI.SetCurrentSite(connectedSite.Name)
+	dashboardController = dashboard.NewController(dashboardStore, dashboard.Actions{
+		OnDisconnect: func() {
+			go func() {
+				if err := actions.OnDisconnect(); err != nil {
+					log.Printf("Dashboard disconnect failed: %v", err)
+					trayUI.SetStatusError("断开 VPN 失败")
+				}
+			}()
+		},
+		OnReconnect: func() {
+			go actions.OnReconnect()
+		},
+		OnCodexMode: func() {
+			actions.OnCodexMode()
+		},
+		OnRestoreNormal: func() {
+			actions.OnRestoreNormal()
+		},
+		OnToggleSplit: func(enabled bool) {
+			go actions.OnToggleSplit(enabled)
+		},
+		OnUpdateIPDB: func() {
+			actions.OnUpdateIPDB()
+		},
+		OnViewLog: func() {
+			actions.OnViewLog()
+		},
+		OnToggleAutoStart: func(enabled bool) {
+			go func() {
+				if err := actions.OnToggleAuto(enabled); err != nil {
+					log.Printf("Dashboard autostart toggle failed: %v", err)
+				}
+			}()
+		},
+		OnContactAuthor: actions.OnContactAuthor,
+		OnQuit:          actions.OnQuit,
+	})
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := dashboardController.ProcessPendingCommands(); err != nil {
+				log.Printf("Dashboard command processing failed: %v", err)
+			}
+		}
+	}()
 
 	// Handle VPN state changes in background
 	go func() {
