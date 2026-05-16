@@ -1,40 +1,19 @@
-# AnyConnect Split Tunnel Configuration
+# AnyConnect Split Tunnel distribution configuration
 
-# Original gateway (auto-detected, saved here for recovery)
 original_gateway: ""
-
-# Original local interface index (auto-detected, saved here for stable routes)
 original_interface_index: 0
-
-# Original IPv6 gateway/interface (auto-detected; IPv6 routes are skipped if empty)
 original_ipv6_gateway: ""
 original_ipv6_interface_index: 0
-
-# Enable/disable split tunneling
 split_tunnel_enabled: true
-
-# Traffic backend: auto, openconnect_tun, cisco_static
 traffic_backend: "auto"
 openconnect_path: ""
 sing_box_path: ""
-
-# IPv6 CN routes are disabled by default because thousands of IPv6 host routes
-# make Windows/AnyConnect noticeably less stable on some machines.
 ipv6_split_enabled: false
-
-# Start with Windows
 auto_start: false
-
-# Connect automatically with credentials stored in Windows Credential Manager
 auto_connect: false
-
-# Preferred VPN site for foreign/global traffic. Domestic traffic bypasses VPN through split routes.
 preferred_site: "23.澳大利亚"
-
-# Saved username for auto-connect. Password is stored in Windows Credential Manager.
 saved_username: ""
 
-# Codex stable mode tests these sites in order, then picks the fastest healthy one.
 codex_auto_select: true
 codex_preferred_site: "23.澳大利亚"
 codex_probe_attempts: 2
@@ -48,19 +27,12 @@ codex_candidate_sites:
   - "25.英国"
   - "24.美国"
 
-# Optional host-route exceptions. Leave empty unless a specific domestic domain must bypass VPN.
 domestic_domain_exceptions: []
 
-# IP database update interval (days)
 update_interval_days: 7
-
-# Last IP database update time
 last_update: "0001-01-01T00:00:00Z"
-
-# Log level: debug, info, warn, error
 log_level: "info"
 
-# VPN 站点列表
 vpn_sites:
   - name: "01.国内专线-上海节点"
     server: "https://api008621.ciscovnp.com:10000"
@@ -99,5 +71,4 @@ vpn_sites:
   - name: "28.南非"
     server: "https://api0027.ciscovnp.com:10000"
 
-# vpncli.exe path (auto-detected if empty)
 vpncli_path: ""
