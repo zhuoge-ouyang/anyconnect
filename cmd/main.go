@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -36,6 +37,10 @@ import (
 const credentialTarget = "AnyConnectSplitTunnel"
 const desktopShortcutName = "分流守卫.lnk"
 const legacyDesktopShortcutName = "Split Tunnel.lnk"
+const shortcutIconFileName = "app-shortcut.ico"
+const maxLogFileBytes = 20 * 1024 * 1024
+const maxLogBackups = 3
+const shortcutDescription = "分流守卫"
 
 var (
 	modUser32       = windows.NewLazySystemDLL("user32.dll")
@@ -69,6 +74,19 @@ func ensureSingleInstance() {
 	}
 }
 
+func shouldRefreshAfterIPDBUpdate(splitEnabled bool, state monitor.VPNState, usingTun bool, tunActive bool) bool {
+	if !splitEnabled {
+		return false
+	}
+	if state != monitor.StateActive && state != monitor.StateConnected {
+		return false
+	}
+	if usingTun && !tunActive {
+		return false
+	}
+	return true
+}
+
 func ensureDesktopShortcut(ctx context.Context) {
 	desktop := filepath.Join(os.Getenv("USERPROFILE"), "Desktop")
 	shortcut := filepath.Join(desktop, desktopShortcutName)
@@ -82,35 +100,115 @@ func ensureDesktopShortcut(ctx context.Context) {
 		}
 	}
 	if _, err := os.Stat(shortcut); err == nil {
-		updateShortcutIcon(ctx, shortcut)
-		return // 已存在
+		return // 快捷方式已存在，跳过更新（避免开机自启时触发不必要的 COM 调用）
 	}
 
+	createOrUpdateShortcut(ctx, shortcut)
+}
+
+func shortcutIconPath(workDir string) string {
+	return filepath.Join(workDir, shortcutIconFileName)
+}
+
+// COM GUIDs for IShellLink shortcut creation
+var (
+	clsidShellLink  = windows.GUID{Data1: 0x00021401, Data2: 0x0000, Data3: 0x0000, Data4: [8]byte{0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}
+	iidIShellLinkW  = windows.GUID{Data1: 0x000214F9, Data2: 0x0000, Data3: 0x0000, Data4: [8]byte{0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}
+	iidIPersistFile = windows.GUID{Data1: 0x0000010B, Data2: 0x0000, Data3: 0x0000, Data4: [8]byte{0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}
+)
+
+// createShortcutCOM creates or updates a .lnk shortcut using Windows COM API
+// (IShellLink + IPersistFile), completely avoiding PowerShell execution.
+func createShortcutCOM(shortcutPath, targetPath, workDir, iconPath, description string) error {
+	ole32 := windows.NewLazySystemDLL("ole32.dll")
+	procCoInit := ole32.NewProc("CoInitializeEx")
+	procCoCreate := ole32.NewProc("CoCreateInstance")
+	procCoUninit := ole32.NewProc("CoUninitialize")
+
+	hr, _, _ := procCoInit.Call(0, 2) // COINIT_APARTMENTTHREADED
+	if hr != 0 && hr != 1 {           // S_OK or S_FALSE (already initialized)
+		return fmt.Errorf("CoInitializeEx failed: 0x%x", hr)
+	}
+	defer procCoUninit.Call()
+
+	var pShellLink unsafe.Pointer
+	hr, _, _ = procCoCreate.Call(
+		uintptr(unsafe.Pointer(&clsidShellLink)),
+		0,
+		1, // CLSCTX_INPROC_SERVER
+		uintptr(unsafe.Pointer(&iidIShellLinkW)),
+		uintptr(unsafe.Pointer(&pShellLink)),
+	)
+	if hr != 0 {
+		return fmt.Errorf("CoCreateInstance(IShellLink) failed: 0x%x", hr)
+	}
+
+	// Get vtable from COM object (use unsafe.Pointer to avoid go vet false positives)
+	shellLink := uintptr(pShellLink)
+	vtbl := (*[64]uintptr)(*(*unsafe.Pointer)(pShellLink))
+	defer syscall.SyscallN(vtbl[2], shellLink) // IUnknown::Release
+
+	// IShellLinkW::SetPath (vtable index 20)
+	pTarget, _ := windows.UTF16PtrFromString(targetPath)
+	if hr, _, _ = syscall.SyscallN(vtbl[20], shellLink, uintptr(unsafe.Pointer(pTarget))); hr != 0 {
+		return fmt.Errorf("IShellLink::SetPath failed: 0x%x", hr)
+	}
+
+	// IShellLinkW::SetWorkingDirectory (vtable index 9)
+	pWorkDir, _ := windows.UTF16PtrFromString(workDir)
+	if hr, _, _ = syscall.SyscallN(vtbl[9], shellLink, uintptr(unsafe.Pointer(pWorkDir))); hr != 0 {
+		return fmt.Errorf("IShellLink::SetWorkingDirectory failed: 0x%x", hr)
+	}
+
+	// IShellLinkW::SetDescription (vtable index 7)
+	pDesc, _ := windows.UTF16PtrFromString(description)
+	if hr, _, _ = syscall.SyscallN(vtbl[7], shellLink, uintptr(unsafe.Pointer(pDesc))); hr != 0 {
+		return fmt.Errorf("IShellLink::SetDescription failed: 0x%x", hr)
+	}
+
+	// IShellLinkW::SetIconLocation (vtable index 17)
+	pIcon, _ := windows.UTF16PtrFromString(iconPath)
+	if hr, _, _ = syscall.SyscallN(vtbl[17], shellLink, uintptr(unsafe.Pointer(pIcon)), 0); hr != 0 {
+		return fmt.Errorf("IShellLink::SetIconLocation failed: 0x%x", hr)
+	}
+
+	// QueryInterface for IPersistFile (vtable index 0)
+	var pPersistFile unsafe.Pointer
+	if hr, _, _ = syscall.SyscallN(vtbl[0], shellLink, uintptr(unsafe.Pointer(&iidIPersistFile)), uintptr(unsafe.Pointer(&pPersistFile))); hr != 0 {
+		return fmt.Errorf("QueryInterface(IPersistFile) failed: 0x%x", hr)
+	}
+	persistFile := uintptr(pPersistFile)
+	pfVtbl := (*[64]uintptr)(*(*unsafe.Pointer)(pPersistFile))
+	defer syscall.SyscallN(pfVtbl[2], persistFile) // IPersistFile::Release
+
+	// IPersistFile::Save (vtable index 6)
+	pShortcut, _ := windows.UTF16PtrFromString(shortcutPath)
+	if hr, _, _ = syscall.SyscallN(pfVtbl[6], persistFile, uintptr(unsafe.Pointer(pShortcut)), 1); hr != 0 {
+		return fmt.Errorf("IPersistFile::Save failed: 0x%x", hr)
+	}
+
+	return nil
+}
+
+func createOrUpdateShortcut(_ context.Context, shortcut string) {
 	exePath, _ := os.Executable()
 	exePath, _ = filepath.EvalSymlinks(exePath)
 	workDir := filepath.Dir(exePath)
-	iconPath := filepath.Join(workDir, "app.ico")
+	iconPath := shortcutIconPath(workDir)
 
-	psScript := fmt.Sprintf(
-		`$ws = New-Object -ComObject WScript.Shell; $sc = $ws.CreateShortcut('%s'); $sc.TargetPath = '%s'; $sc.WorkingDirectory = '%s'; $sc.IconLocation = '%s'; $sc.Description = 'AnyConnect Split Tunnel'; $sc.Save()`,
-		shortcut, exePath, workDir, iconPath,
-	)
-	if err := exec.CommandContext(ctx, "powershell", "-NonInteractive", "-Command", psScript).Run(); err != nil {
-		log.Printf("Desktop shortcut creation failed or timed out: %v", err)
+	if err := createShortcutCOM(shortcut, exePath, workDir, iconPath, shortcutDescription); err != nil {
+		log.Printf("Desktop shortcut creation failed: %v", err)
 	}
 }
 
-func updateShortcutIcon(ctx context.Context, shortcut string) {
+func updateShortcut(_ context.Context, shortcut string) {
 	exePath, _ := os.Executable()
 	exePath, _ = filepath.EvalSymlinks(exePath)
 	workDir := filepath.Dir(exePath)
-	iconPath := filepath.Join(workDir, "app.ico")
-	psScript := fmt.Sprintf(
-		`$ws = New-Object -ComObject WScript.Shell; $sc = $ws.CreateShortcut('%s'); $sc.IconLocation = '%s'; $sc.Save()`,
-		shortcut, iconPath,
-	)
-	if err := exec.CommandContext(ctx, "powershell", "-NonInteractive", "-Command", psScript).Run(); err != nil {
-		log.Printf("Desktop shortcut icon update failed or timed out: %v", err)
+	iconPath := shortcutIconPath(workDir)
+
+	if err := createShortcutCOM(shortcut, exePath, workDir, iconPath, shortcutDescription); err != nil {
+		log.Printf("Desktop shortcut update failed: %v", err)
 	}
 }
 
@@ -119,6 +217,14 @@ func ensureAppIcon() {
 	if err := os.WriteFile(iconPath, tray.AppIcon, 0644); err != nil {
 		log.Printf("Failed to write app icon: %v", err)
 	}
+	shortcutIcon := shortcutIconPath(baseDir())
+	if err := os.WriteFile(shortcutIcon, tray.AppIcon, 0644); err != nil {
+		log.Printf("Failed to write shortcut icon: %v", err)
+	}
+}
+
+func psQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
 func isAdmin() bool {
@@ -148,6 +254,25 @@ func baseDir() string {
 	return filepath.Dir(exe)
 }
 
+func rotateLogFile(path string, maxBytes int64, backups int) {
+	if maxBytes <= 0 || backups <= 0 {
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.Size() <= maxBytes {
+		return
+	}
+	_ = os.Remove(fmt.Sprintf("%s.%d", path, backups))
+	for i := backups - 1; i >= 1; i-- {
+		oldPath := fmt.Sprintf("%s.%d", path, i)
+		newPath := fmt.Sprintf("%s.%d", path, i+1)
+		if _, err := os.Stat(oldPath); err == nil {
+			_ = os.Rename(oldPath, newPath)
+		}
+	}
+	_ = os.Rename(path, path+".1")
+}
+
 // hideConsole 使用 FreeConsole 完全释放控制台，而不是隐藏窗口
 // FreeConsole 不会影响后续 GUI 窗口（如 systray）的创建和消息循环
 func hideConsole() {
@@ -168,6 +293,29 @@ func showErrorDialog(title, message string) {
 	msgPtr, _ := syscall.UTF16PtrFromString(message)
 	// MB_OK | MB_ICONERROR | MB_TOPMOST = 0x00000000 | 0x00000010 | 0x00040000
 	messageBox.Call(0, uintptr(unsafe.Pointer(msgPtr)), uintptr(unsafe.Pointer(titlePtr)), 0x00040010)
+}
+
+func connectionFailureMessage(err error) string {
+	if err == nil {
+		return "连接失败，请重试。"
+	}
+	if errors.Is(err, tun.ErrOpenConnectAuthentication) {
+		return "VPN 认证失败：请检查账号/密码是否正确，或确认该账号有当前节点权限。"
+	}
+	raw := err.Error()
+	lower := strings.ToLower(raw)
+	if strings.Contains(lower, "sing-box exited before tun became ready") ||
+		strings.Contains(lower, "cannot create a file when that file already exists") {
+		return "分流内核启动失败：检测到上一次连接残留的 TUN 网卡或后台进程。\n\n程序已尝试自动清理，请重新连接一次；如果仍然失败，请先退出分流守卫再重新打开。"
+	}
+	return raw + "\n\n请换个节点重试。"
+}
+
+func shouldFallbackFromOpenConnect(err error, backend string) bool {
+	if errors.Is(err, tun.ErrOpenConnectAuthentication) {
+		return false
+	}
+	return backend != config.TrafficBackendOpenTun
 }
 
 func preferredSite(sites []ui.Site, preferred string) (ui.Site, bool) {
@@ -429,6 +577,7 @@ func main() {
 
 	// 3. 日志初始化
 	logFile := filepath.Join(baseDir(), "split-tunnel.log")
+	rotateLogFile(logFile, maxLogFileBytes, maxLogBackups)
 	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err == nil {
 		log.SetOutput(f)
@@ -662,6 +811,7 @@ func main() {
 		LocalGateway:        cfg.OriginalGateway,
 		LocalInterfaceIndex: cfg.OriginalInterfaceIndex,
 		DirectDomains:       append([]string{"cn"}, cfg.DomesticDomains...),
+		SingBoxLogLevel:     cfg.LogLevel,
 	})
 	var sessionMu sync.Mutex
 	activeBackend := ""
@@ -765,11 +915,12 @@ func main() {
 				setActiveBackend(config.TrafficBackendOpenTun)
 				return config.TrafficBackendOpenTun, nil
 			} else {
-				log.Printf("OpenConnect TUN unavailable, falling back to Cisco static backend: %v", err)
 				_ = tunSession.Stop()
-				if cfg.TrafficBackend == config.TrafficBackendOpenTun {
+				if !shouldFallbackFromOpenConnect(err, cfg.TrafficBackend) {
+					log.Printf("OpenConnect TUN failed without fallback: %v", err)
 					return "", err
 				}
+				log.Printf("OpenConnect TUN unavailable, falling back to Cisco static backend: %v", err)
 			}
 		}
 
@@ -799,7 +950,7 @@ func main() {
 		backend, err := connectWithBestBackend(selectedSite, username, password)
 		if err != nil {
 			log.Printf("VPN connection failed: %v", err)
-			showErrorDialog("连接失败", err.Error()+"\n\n请换个节点重试。")
+			showErrorDialog("连接失败", connectionFailureMessage(err))
 			allowAutoConnect = false
 			continue
 		}
@@ -1265,9 +1416,11 @@ func main() {
 				}
 
 				state := vpnMon.State()
-				if cfg.SplitTunnelEnabled && (state == monitor.StateActive || state == monitor.StateConnected) {
+				tunBackend := usingTun()
+				tunActive := !tunBackend || tunSession.Active()
+				if shouldRefreshAfterIPDBUpdate(cfg.SplitTunnelEnabled, state, tunBackend, tunActive) {
 					if trayUI != nil {
-						if usingTun() {
+						if tunBackend {
 							trayUI.SetStatusBusy("IP 数据库已更新，正在刷新 TUN 规则...")
 						} else {
 							trayUI.SetStatusBusy("IP 数据库已更新，正在刷新路由...")
@@ -1275,6 +1428,8 @@ func main() {
 					}
 					resetRouteOps()
 					applySplitRoutes(true)
+				} else if cfg.SplitTunnelEnabled && tunBackend && !tunActive && trayUI != nil {
+					trayUI.SetStatusBusy("IP 数据库已更新，重连后生效")
 				}
 			}()
 		},
@@ -1473,7 +1628,9 @@ func main() {
 					cfg.Save()
 					log.Println("Auto-update completed")
 					state := vpnMon.State()
-					if cfg.SplitTunnelEnabled && (state == monitor.StateActive || state == monitor.StateConnected) {
+					tunBackend := usingTun()
+					tunActive := !tunBackend || tunSession.Active()
+					if shouldRefreshAfterIPDBUpdate(cfg.SplitTunnelEnabled, state, tunBackend, tunActive) {
 						resetRouteOps()
 						applySplitRoutes(true)
 					}

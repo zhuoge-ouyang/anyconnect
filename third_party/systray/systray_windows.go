@@ -7,11 +7,13 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"io/ioutil"
+	stdlog "log"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -286,8 +288,17 @@ func (t *winTray) wndProc(hWnd windows.Handle, message uint32, wParam, lParam ui
 			t.showMenu()
 		}
 	case t.wmTaskbarCreated: // on explorer.exe restarts
+		const (
+			NIF_ICON = 0x00000002
+			NIF_TIP  = 0x00000004
+		)
 		t.muNID.Lock()
 		t.nid.add()
+		// After Explorer.exe restarts, NIM_ADD alone may not fully restore
+		// the icon and tooltip. Issue NIM_MODIFY to re-apply them.
+		if t.nid.Flags&(NIF_ICON|NIF_TIP) != 0 {
+			t.nid.modify()
+		}
 		t.muNID.Unlock()
 	default:
 		// Calls the default window procedure to provide default processing for any window messages that an application does not process.
@@ -422,7 +433,6 @@ func (t *winTray) initInstance() error {
 	)
 
 	t.muNID.Lock()
-	defer t.muNID.Unlock()
 	t.nid = &notifyIconData{
 		Wnd:             windows.Handle(t.window),
 		ID:              100,
@@ -430,8 +440,32 @@ func (t *winTray) initInstance() error {
 		CallbackMessage: t.wmSystrayMessage,
 	}
 	t.nid.Size = uint32(unsafe.Sizeof(*t.nid))
+	t.muNID.Unlock()
 
-	return t.nid.add()
+	// Retry nid.add() with increasing delays.
+	// On Windows boot the notification area (Shell_TrayWnd) may not be fully
+	// ready, causing Shell_NotifyIconW(NIM_ADD) to fail transiently.
+	retryDelays := []time.Duration{
+		1 * time.Second,
+		2 * time.Second,
+		3 * time.Second,
+		5 * time.Second,
+		8 * time.Second,
+	}
+	err = t.nid.add()
+	if err == nil {
+		return nil
+	}
+	for i, delay := range retryDelays {
+		stdlog.Printf("[systray] initInstance: nid.add() failed (attempt %d), retrying in %v: %v", i+1, delay, err)
+		time.Sleep(delay)
+		err = t.nid.add()
+		if err == nil {
+			stdlog.Printf("[systray] initInstance: nid.add() succeeded on retry %d", i+2)
+			return nil
+		}
+	}
+	return err
 }
 
 func (t *winTray) createMenu() error {
@@ -775,17 +809,25 @@ func (t *winTray) iconToBitmap(hIcon windows.Handle) (windows.Handle, error) {
 }
 
 func registerSystray() {
+	stdlog.Println("[systray] registerSystray: calling initInstance...")
 	if err := wt.initInstance(); err != nil {
+		stdlog.Printf("[systray] registerSystray: initInstance FAILED: %v", err)
 		log.Errorf("Unable to init instance: %v", err)
 		return
 	}
+	stdlog.Println("[systray] registerSystray: initInstance OK")
 
+	stdlog.Println("[systray] registerSystray: calling createMenu...")
 	if err := wt.createMenu(); err != nil {
+		stdlog.Printf("[systray] registerSystray: createMenu FAILED: %v", err)
 		log.Errorf("Unable to create menu: %v", err)
 		return
 	}
+	stdlog.Println("[systray] registerSystray: createMenu OK")
 
+	stdlog.Println("[systray] registerSystray: calling systrayReady...")
 	systrayReady()
+	stdlog.Println("[systray] registerSystray: systrayReady returned")
 }
 
 func nativeLoop() {
@@ -848,10 +890,12 @@ func iconBytesToFilePath(iconBytes []byte) (string, error) {
 func SetIcon(iconBytes []byte) {
 	iconFilePath, err := iconBytesToFilePath(iconBytes)
 	if err != nil {
+		stdlog.Printf("[systray] SetIcon: iconBytesToFilePath FAILED: %v", err)
 		log.Errorf("Unable to write icon data to temp file: %v", err)
 		return
 	}
 	if err := wt.setIcon(iconFilePath); err != nil {
+		stdlog.Printf("[systray] SetIcon: setIcon FAILED: %v", err)
 		log.Errorf("Unable to set icon: %v", err)
 		return
 	}

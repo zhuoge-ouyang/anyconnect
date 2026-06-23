@@ -50,28 +50,30 @@ type Config struct {
 
 func DefaultConfig() *Config {
 	return &Config{
-		SplitTunnelEnabled: true,
-		IPv6SplitEnabled:   false,
-		AutoStart:          false,
-		AutoConnect:        false,
-		PreferredSite:      DefaultGlobalPreferredSite,
-		CodexAutoSelect:    true,
-		CodexPreferredSite: DefaultGlobalPreferredSite,
-		CodexProbeAttempts: 2,
-		CodexCandidateSites: []string{
-			"03.国内专线-深圳节点",
-			"05.国内专线-贵州节点",
-			"20.泰国",
-			"21.韩国",
-			"22.日本",
-			"23.澳大利亚",
-			"25.英国",
-			"24.美国",
-		},
-		UpdateIntervalDays: 7,
-		LogLevel:           "info",
-		VPNSites:           defaultVPNSites(),
-		TrafficBackend:     TrafficBackendAuto,
+		SplitTunnelEnabled:  true,
+		IPv6SplitEnabled:    false,
+		AutoStart:           false,
+		AutoConnect:         false,
+		PreferredSite:       DefaultGlobalPreferredSite,
+		CodexAutoSelect:     true,
+		CodexPreferredSite:  DefaultGlobalPreferredSite,
+		CodexProbeAttempts:  2,
+		CodexCandidateSites: defaultCodexCandidateSites(),
+		UpdateIntervalDays:  7,
+		LogLevel:            "warn",
+		VPNSites:            defaultVPNSites(),
+		TrafficBackend:      TrafficBackendAuto,
+	}
+}
+
+func defaultCodexCandidateSites() []string {
+	return []string{
+		"23.澳大利亚",
+		"22.日本",
+		"21.韩国",
+		"20.泰国",
+		"25.英国",
+		"24.美国",
 	}
 }
 
@@ -149,7 +151,7 @@ func (c *Config) normalize() {
 		c.UpdateIntervalDays = 7
 	}
 	if c.LogLevel == "" {
-		c.LogLevel = "info"
+		c.LogLevel = "warn"
 	}
 	switch strings.ToLower(strings.TrimSpace(c.TrafficBackend)) {
 	case "", TrafficBackendAuto:
@@ -168,16 +170,7 @@ func (c *Config) normalize() {
 		c.CodexProbeAttempts = 2
 	}
 	if len(c.CodexCandidateSites) == 0 {
-		c.CodexCandidateSites = []string{
-			"03.国内专线-深圳节点",
-			"05.国内专线-贵州节点",
-			"20.泰国",
-			"21.韩国",
-			"22.日本",
-			"23.澳大利亚",
-			"25.英国",
-			"24.美国",
-		}
+		c.CodexCandidateSites = defaultCodexCandidateSites()
 	}
 	if isLegacyDefaultDomesticDomains(c.DomesticDomains) {
 		c.DomesticDomains = nil

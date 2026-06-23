@@ -1,7 +1,8 @@
 param(
     [string]$CiscoInstallerPath = "",
     [string]$OutputDir = "",
-    [switch]$KeepPayload
+    [switch]$KeepPayload,
+    [switch]$AllowMissingBundledTools
 )
 
 $ErrorActionPreference = "Stop"
@@ -29,7 +30,9 @@ function Copy-RequiredPayload {
     New-Item -ItemType Directory -Path (Join-Path $payloadDir "data") -Force | Out-Null
 
     Copy-Item -LiteralPath $appExe -Destination (Join-Path $payloadDir "anyconnect-split.exe") -Force
-    Copy-Item -LiteralPath (Join-Path $root "internal\tray\app.ico") -Destination (Join-Path $payloadDir "app.ico") -Force
+    $appIcon = Join-Path $root "internal\tray\app.ico"
+    Copy-Item -LiteralPath $appIcon -Destination (Join-Path $payloadDir "app.ico") -Force
+    Copy-Item -LiteralPath $appIcon -Destination (Join-Path $payloadDir "app-shortcut.ico") -Force
     Copy-Item -LiteralPath (Join-Path $root "configs\config.dist.yaml") -Destination (Join-Path $payloadDir "configs\config.yaml") -Force
 
     Copy-IpDatabaseSeed
@@ -41,27 +44,33 @@ function Copy-RequiredPayload {
         Write-Host "Bundling OpenConnect from $openconnectSrc ..."
         New-Item -ItemType Directory -Force -Path $openconnectDst | Out-Null
         Copy-Item -Path "$openconnectSrc\*" -Destination $openconnectDst -Recurse -Force
-        Write-Host "  Done. Files: $((Get-ChildItem $openconnectDst).Count)"
+        Assert-FileExists -Path (Join-Path $openconnectDst "openconnect.exe") -Message "Bundled OpenConnect is missing openconnect.exe."
+        Assert-FileExists -Path (Join-Path $openconnectDst "wintun.dll") -Message "Bundled OpenConnect is missing wintun.dll."
+        Write-Host "  Done. Files: $((Get-ChildItem $openconnectDst -Recurse -File).Count)"
     } else {
-        Write-Warning "OpenConnect not found at $openconnectSrc - skipping bundle"
+        if ($AllowMissingBundledTools) {
+            Write-Warning "OpenConnect not found at $openconnectSrc - skipping bundle"
+        } else {
+            throw "OpenConnect not found at $openconnectSrc. Install OpenConnect or pass -AllowMissingBundledTools for a non-self-contained package."
+        }
     }
 
     # --- Bundle sing-box ---
     $toolsDst = Join-Path $payloadDir "tools"
     New-Item -ItemType Directory -Force -Path $toolsDst | Out-Null
 
-    # sing-box: 尝试查找实际二进制（chocolatey shim 指向实际文件）
-    $singBoxCandidates = @(
-        "C:\ProgramData\chocolatey\lib\sing-box\tools\sing-box-1.12.17-windows-amd64\sing-box.exe",
-        "C:\ProgramData\chocolatey\lib\sing-box\tools\sing-box.exe"
-    )
+    # sing-box: 优先查找真实二进制，避免打包 Chocolatey shim。
     $singBoxSrc = $null
-    foreach ($candidate in $singBoxCandidates) {
-        if (Test-Path $candidate) {
-            $singBoxSrc = $candidate
-            break
+    $singBoxRoot = "C:\ProgramData\chocolatey\lib\sing-box"
+    if (Test-Path -LiteralPath $singBoxRoot) {
+        $realSingBox = Get-ChildItem -LiteralPath $singBoxRoot -Recurse -Filter "sing-box.exe" -File -ErrorAction SilentlyContinue |
+            Sort-Object Length -Descending |
+            Select-Object -First 1
+        if ($realSingBox) {
+            $singBoxSrc = $realSingBox.FullName
         }
     }
+
     # 如果上面都找不到，尝试 which
     if (-not $singBoxSrc) {
         $singBoxCmd = Get-Command "sing-box.exe" -ErrorAction SilentlyContinue
@@ -71,11 +80,19 @@ function Copy-RequiredPayload {
     if ($singBoxSrc) {
         Write-Host "Bundling sing-box from $singBoxSrc ..."
         Copy-Item -Path $singBoxSrc -Destination (Join-Path $toolsDst "sing-box.exe") -Force
+        Assert-FileExists -Path (Join-Path $toolsDst "sing-box.exe") -Message "Bundled sing-box is missing."
+        Assert-MinFileSize -Path (Join-Path $toolsDst "sing-box.exe") -MinBytes 10485760 -Message "Bundled sing-box.exe looks like a shim instead of the real binary."
         $sz = [math]::Round((Get-Item (Join-Path $toolsDst "sing-box.exe")).Length / 1MB, 1)
         Write-Host "  Done. Size: ${sz} MB"
     } else {
-        Write-Warning "sing-box.exe not found - skipping bundle"
+        if ($AllowMissingBundledTools) {
+            Write-Warning "sing-box.exe not found - skipping bundle"
+        } else {
+            throw "sing-box.exe not found. Install sing-box or pass -AllowMissingBundledTools for a non-self-contained package."
+        }
     }
+
+    Assert-SelfContainedPayload
 
     if ($CiscoInstallerPath -ne "") {
         $resolvedCisco = (Resolve-Path $CiscoInstallerPath).Path
@@ -88,6 +105,44 @@ function Copy-RequiredPayload {
         Copy-Item -LiteralPath $resolvedCisco -Destination (Join-Path $ciscoDir ([System.IO.Path]::GetFileName($resolvedCisco))) -Force
         Write-Host "Bundled Cisco installer: $resolvedCisco"
     }
+}
+
+function Assert-FileExists {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$Message
+    )
+
+    if (!(Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw $Message
+    }
+}
+
+function Assert-MinFileSize {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][long]$MinBytes,
+        [Parameter(Mandatory=$true)][string]$Message
+    )
+
+    Assert-FileExists -Path $Path -Message $Message
+    if ((Get-Item -LiteralPath $Path).Length -lt $MinBytes) {
+        throw $Message
+    }
+}
+
+function Assert-SelfContainedPayload {
+    Assert-FileExists -Path (Join-Path $payloadDir "anyconnect-split.exe") -Message "Payload is missing the main application."
+    Assert-FileExists -Path (Join-Path $payloadDir "configs\config.yaml") -Message "Payload is missing config.yaml."
+    Assert-FileExists -Path (Join-Path $payloadDir "data\china_ip_list.txt") -Message "Payload is missing the China IP database."
+
+    if ($AllowMissingBundledTools) {
+        return
+    }
+
+    Assert-FileExists -Path (Join-Path $payloadDir "openconnect\openconnect.exe") -Message "Self-contained payload is missing openconnect.exe."
+    Assert-FileExists -Path (Join-Path $payloadDir "openconnect\wintun.dll") -Message "Self-contained payload is missing wintun.dll."
+    Assert-FileExists -Path (Join-Path $payloadDir "tools\sing-box.exe") -Message "Self-contained payload is missing sing-box.exe."
 }
 
 function Test-IpListFile {

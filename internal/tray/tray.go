@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/getlantern/systray"
 )
@@ -51,6 +52,7 @@ type Tray struct {
 	menuAutoStart     *systray.MenuItem
 	menuContactAuthor *systray.MenuItem
 	menuQuit          *systray.MenuItem
+	iconAnimator      *trayIconAnimator
 	splitEnabled      bool
 	autoStart         bool
 	currentSite       string
@@ -69,7 +71,8 @@ func New(actions Actions, splitEnabled bool, autoStart bool) *Tray {
 			SplitEnabled: splitEnabled,
 			AutoStart:    autoStart,
 		},
-		ready: make(chan struct{}),
+		iconAnimator: newTrayIconAnimator(nil),
+		ready:        make(chan struct{}),
 	}
 }
 
@@ -122,6 +125,7 @@ func (t *Tray) Run() {
 }
 
 func (t *Tray) onReady() {
+	log.Println("[tray] onReady: entered")
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("PANIC in tray onReady: %v", r)
@@ -132,11 +136,14 @@ func (t *Tray) onReady() {
 		default:
 			close(t.ready)
 		}
+		log.Println("[tray] onReady: defer complete, ready channel closed")
 	}()
 
 	log.Println("Tray onReady called, initializing...")
 
-	systray.SetIcon(iconIdle)
+	log.Println("[tray] onReady: calling setTrayIconMode(idle)...")
+	t.setTrayIconMode(trayIconModeIdle)
+	log.Println("[tray] onReady: setTrayIconMode(idle) returned")
 	systray.SetTitle("AnyConnect Split")
 	if t.initialTooltip != "" {
 		systray.SetTooltip(t.initialTooltip)
@@ -191,11 +198,19 @@ func (t *Tray) onReady() {
 	go t.handleQuitClicks()
 }
 
-func (t *Tray) onExit() {}
+func (t *Tray) onExit() {
+	t.stopTrayIconAnimation()
+}
 
-// WaitReady blocks until the tray is fully initialized.
+// WaitReady blocks until the tray is fully initialized, with a 30-second timeout.
+// If the timeout expires, a warning is logged but execution continues.
 func (t *Tray) WaitReady() {
-	<-t.ready
+	select {
+	case <-t.ready:
+		log.Println("[tray] WaitReady: ready signal received")
+	case <-time.After(30 * time.Second):
+		log.Println("WARNING: [tray] WaitReady: timed out after 30s, onReady may not have been called. Continuing anyway...")
+	}
 }
 
 // ReadyChan returns the ready channel so callers can implement their own timeout logic.
@@ -390,7 +405,7 @@ func (t *Tray) SetStatusIdle() {
 	title := "状态：VPN 未连接"
 	t.SetStatusFields(title, 0, "")
 	if t.menuStatus != nil {
-		systray.SetIcon(iconIdle)
+		t.setTrayIconMode(trayIconModeIdle)
 		systray.SetTooltip(t.tooltip("VPN 未连接"))
 		t.menuStatus.SetTitle(title)
 	}
@@ -401,7 +416,7 @@ func (t *Tray) SetStatusActive(routeCount int) {
 	title := fmt.Sprintf("状态：分流已启用（%d 条路由）", routeCount)
 	t.SetStatusFields(title, routeCount, "")
 	if t.menuStatus != nil {
-		systray.SetIcon(iconActive)
+		t.setTrayIconMode(trayIconModeActive)
 		systray.SetTooltip(t.tooltip("VPN 已连接"))
 		t.menuStatus.SetTitle(title)
 	}
@@ -412,7 +427,7 @@ func (t *Tray) SetStatusTunActive() {
 	title := "状态：TUN 分流已启用"
 	t.SetStatusFields(title, 0, "")
 	if t.menuStatus != nil {
-		systray.SetIcon(iconActive)
+		t.setTrayIconMode(trayIconModeActive)
 		systray.SetTooltip(t.tooltip("TUN 分流已启用"))
 		t.menuStatus.SetTitle(title)
 	}
@@ -423,7 +438,7 @@ func (t *Tray) SetStatusTunFullTunnel() {
 	title := "状态：TUN 全隧道已启用"
 	t.SetStatusFields(title, 0, "")
 	if t.menuStatus != nil {
-		systray.SetIcon(iconActive)
+		t.setTrayIconMode(trayIconModeActive)
 		systray.SetTooltip(t.tooltip("TUN 全隧道已启用"))
 		t.menuStatus.SetTitle(title)
 	}
@@ -434,7 +449,7 @@ func (t *Tray) SetStatusStaticFallback(routeCount int) {
 	title := fmt.Sprintf("状态：已回退静态路由（%d 条路由）", routeCount)
 	t.SetStatusFields(title, routeCount, "")
 	if t.menuStatus != nil {
-		systray.SetIcon(iconActive)
+		t.setTrayIconMode(trayIconModeActive)
 		systray.SetTooltip(t.tooltip("已回退静态路由"))
 		t.menuStatus.SetTitle(title)
 	}
@@ -445,7 +460,7 @@ func (t *Tray) SetStatusSplitDisabled() {
 	title := "状态：VPN 已连接，分流未启用"
 	t.SetStatusFields(title, 0, "")
 	if t.menuStatus != nil {
-		systray.SetIcon(iconIdle)
+		t.setTrayIconMode(trayIconModeIdle)
 		systray.SetTooltip(t.tooltip("分流未启用"))
 		t.menuStatus.SetTitle(title)
 	}
@@ -456,7 +471,7 @@ func (t *Tray) SetStatusBusy(msg string) {
 	title := fmt.Sprintf("状态：%s", msg)
 	t.SetStatusFields(title, 0, "")
 	if t.menuStatus != nil {
-		systray.SetIcon(iconBusy)
+		t.setTrayIconMode(trayIconModeBusy)
 		systray.SetTooltip(t.tooltip("处理中..."))
 		t.menuStatus.SetTitle(title)
 	}
@@ -467,7 +482,7 @@ func (t *Tray) SetStatusError(msg string) {
 	title := fmt.Sprintf("错误：%s", msg)
 	t.SetStatusFields(title, 0, msg)
 	if t.menuStatus != nil {
-		systray.SetIcon(iconError)
+		t.setTrayIconMode(trayIconModeError)
 		systray.SetTooltip(t.tooltip("出错"))
 		t.menuStatus.SetTitle(title)
 	}

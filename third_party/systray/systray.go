@@ -5,6 +5,7 @@ package systray
 
 import (
 	"fmt"
+	stdlog "log"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -92,10 +93,14 @@ func Register(onReady func(), onExit func()) {
 		// Run onReady on separate goroutine to avoid blocking event loop
 		readyCh := make(chan interface{})
 		go func() {
+			stdlog.Println("[systray] Register: goroutine waiting for readyCh...")
 			<-readyCh
+			stdlog.Println("[systray] Register: readyCh received, calling onReady...")
 			onReady()
+			stdlog.Println("[systray] Register: onReady returned")
 		}()
 		systrayReady = func() {
+			stdlog.Println("[systray] systrayReady: closing readyCh")
 			close(readyCh)
 		}
 	}

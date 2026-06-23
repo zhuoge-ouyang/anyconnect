@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -23,7 +24,11 @@ import (
 const (
 	defaultInterfaceName = "AnyConnectSplitTun"
 	defaultTunAddress    = "172.19.0.1/30"
+	singBoxPollInterval  = 200 * time.Millisecond
+	singBoxStableWindow  = 1500 * time.Millisecond
 )
+
+var ErrOpenConnectAuthentication = errors.New("OpenConnect authentication failed")
 
 type Options struct {
 	OpenConnectPath     string
@@ -35,6 +40,7 @@ type Options struct {
 	VPNInterfaceName    string
 	InterfaceName       string
 	DirectDomains       []string
+	SingBoxLogLevel     string
 }
 
 type StartOptions struct {
@@ -47,20 +53,21 @@ type StartOptions struct {
 }
 
 type Session struct {
-	mu                 sync.Mutex
-	opts               Options
-	openConnectCmd     *exec.Cmd
-	singBoxCmd         *exec.Cmd
-	openConnectDone    chan error
-	singBoxDone        chan error
-	configPath         string
-	scriptPath         string
-	statePath          string
-	lastDirectCIDRs    []string
-	lastProtectedCIDRs []string
-	lastSplit          bool
-	localInterfaceName string
-	vpnInterfaceName   string
+	mu                    sync.Mutex
+	opts                  Options
+	openConnectCmd        *exec.Cmd
+	singBoxCmd            *exec.Cmd
+	openConnectDone       chan error
+	singBoxDone           chan error
+	configPath            string
+	scriptPath            string
+	statePath             string
+	lastDirectCIDRs       []string
+	lastProtectedCIDRs    []string
+	lastSplit             bool
+	localInterfaceName    string
+	vpnInterfaceName      string
+	openConnectAuthFailed atomic.Bool
 }
 
 func New(opts Options) *Session {
@@ -141,12 +148,15 @@ func (s *Session) Start(ctx context.Context, start StartOptions) error {
 	if err := os.MkdirAll(s.opts.DataDir, 0755); err != nil {
 		return err
 	}
+	s.scriptPath = filepath.Join(s.opts.DataDir, "openconnect-lite.js")
+	s.statePath = filepath.Join(s.opts.DataDir, "openconnect-state.txt")
+	s.configPath = filepath.Join(s.opts.DataDir, "sing-box-tun.json")
+	s.cleanupStaleBackendProcesses()
+
 	localName, err := s.resolveLocalInterfaceName()
 	if err != nil {
 		return err
 	}
-	s.scriptPath = filepath.Join(s.opts.DataDir, "openconnect-lite.js")
-	s.statePath = filepath.Join(s.opts.DataDir, "openconnect-state.txt")
 	if err := s.writeOpenConnectScript(); err != nil {
 		return err
 	}
@@ -212,10 +222,17 @@ func (s *Session) Stop() error {
 func (s *Session) Presence() monitor.VPNPresence {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.openConnectAliveLocked() && s.singBoxAliveLocked() {
+	openConnectStarted := s.openConnectCmd != nil
+	singBoxStarted := s.singBoxCmd != nil
+	openConnectAlive := s.openConnectAliveLocked()
+	singBoxAlive := s.singBoxAliveLocked()
+	if openConnectAlive && singBoxAlive {
 		return monitor.PresenceConnected
 	}
-	if s.openConnectCmd != nil || s.singBoxCmd != nil {
+	if openConnectStarted || singBoxStarted {
+		if !openConnectAlive && !singBoxAlive {
+			return monitor.PresenceDisconnected
+		}
 		return monitor.PresenceUnknown
 	}
 	return monitor.PresenceDisconnected
@@ -250,8 +267,17 @@ func (s *Session) startOpenConnect(start StartOptions) (*exec.Cmd, chan error, e
 	if err := cmd.Start(); err != nil {
 		return nil, nil, err
 	}
-	go logPipe("openconnect", stdout)
-	go logPipe("openconnect", stderr)
+	s.openConnectAuthFailed.Store(false)
+	var pipes sync.WaitGroup
+	pipes.Add(2)
+	go func() {
+		defer pipes.Done()
+		s.logOpenConnectPipe(stdout)
+	}()
+	go func() {
+		defer pipes.Done()
+		s.logOpenConnectPipe(stderr)
+	}()
 
 	if _, err := stdin.Write([]byte(start.Password + "\n")); err != nil {
 		_ = killProcessTree(cmd)
@@ -262,6 +288,7 @@ func (s *Session) startOpenConnect(start StartOptions) (*exec.Cmd, chan error, e
 	done := make(chan error, 1)
 	go func() {
 		err := cmd.Wait()
+		pipes.Wait()
 		if err != nil {
 			log.Printf("OpenConnect exited: %v", err)
 		} else {
@@ -282,12 +309,17 @@ func (s *Session) startSingBoxLocked(directCIDRs []string, protectedCIDRs []stri
 		DirectCIDRs:    directCIDRs,
 		ProtectedCIDRs: protectedCIDRs,
 		DirectDomains:  s.opts.DirectDomains,
+		LogLevel:       s.opts.SingBoxLogLevel,
 		SplitEnabled:   splitEnabled,
 	})
 	if err != nil {
 		return err
 	}
-	configPath := filepath.Join(s.opts.DataDir, "sing-box-tun.json")
+	configPath := s.configPath
+	if strings.TrimSpace(configPath) == "" {
+		configPath = filepath.Join(s.opts.DataDir, "sing-box-tun.json")
+		s.configPath = configPath
+	}
 	if err := os.WriteFile(configPath, configBytes, 0644); err != nil {
 		return err
 	}
@@ -328,6 +360,59 @@ func (s *Session) startSingBoxLocked(directCIDRs []string, protectedCIDRs []stri
 	return nil
 }
 
+func (s *Session) cleanupStaleBackendProcesses() {
+	script := s.staleBackendProcessCleanupScript()
+	if strings.TrimSpace(script) == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command", script)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x08000000}
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("Warning: stale TUN process cleanup failed: %v: %s", err, strings.TrimSpace(string(output)))
+	}
+	time.Sleep(500 * time.Millisecond)
+}
+
+func (s *Session) staleBackendProcessCleanupScript() string {
+	needles := []string{
+		s.configPath,
+		s.scriptPath,
+		s.opts.InterfaceName,
+	}
+	escaped := make([]string, 0, len(needles))
+	for _, needle := range needles {
+		needle = strings.TrimSpace(needle)
+		if needle == "" {
+			continue
+		}
+		escaped = append(escaped, psSingleQuote(needle))
+	}
+	if len(escaped) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(`
+$needles = @(%s)
+Get-CimInstance Win32_Process -Filter "Name = 'sing-box.exe' OR Name = 'openconnect.exe'" |
+  Where-Object {
+    $cmd = [string]$_.CommandLine
+    foreach ($needle in $needles) {
+      if ($cmd -like ('*' + $needle + '*')) { return $true }
+    }
+    return $false
+  } |
+  ForEach-Object {
+    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+  }
+`, strings.Join(escaped, ", "))
+}
+
+func psSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
 func (s *Session) waitForVPNInterface(ctx context.Context, localName string, timeout time.Duration) (string, error) {
 	deadline := time.Now().Add(timeout)
 	var lastErr error
@@ -336,6 +421,9 @@ func (s *Session) waitForVPNInterface(ctx context.Context, localName string, tim
 			return "", err
 		}
 		if !s.openConnectAliveLocked() {
+			if s.openConnectAuthFailed.Load() {
+				return "", ErrOpenConnectAuthentication
+			}
 			return "", fmt.Errorf("OpenConnect exited before VPN interface became available")
 		}
 		if name, err := s.readStateInterfaceName(); err == nil {
@@ -356,15 +444,24 @@ func (s *Session) waitForVPNInterface(ctx context.Context, localName string, tim
 func (s *Session) waitForSingBox(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	var sawProcess bool
+	var readySince time.Time
 	for time.Now().Before(deadline) {
 		if !s.singBoxAliveLocked() {
 			return fmt.Errorf("sing-box exited before TUN became ready")
 		}
 		sawProcess = true
 		if iface, err := net.InterfaceByName(s.opts.InterfaceName); err == nil && iface != nil {
-			return nil
+			now := time.Now()
+			if readySince.IsZero() {
+				readySince = now
+			}
+			if now.Sub(readySince) >= singBoxStableWindow {
+				return nil
+			}
+		} else {
+			readySince = time.Time{}
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(singBoxPollInterval)
 	}
 	if sawProcess {
 		log.Printf("Warning: sing-box is running but TUN interface %s was not visible yet", s.opts.InterfaceName)
@@ -385,6 +482,7 @@ func (s *Session) stopLocked() error {
 	}
 	s.openConnectCmd = nil
 	s.openConnectDone = nil
+	s.openConnectAuthFailed.Store(false)
 	s.lastDirectCIDRs = nil
 	s.lastProtectedCIDRs = nil
 	s.lastSplit = false
@@ -600,13 +698,34 @@ func QuoteScriptPath(path string) string {
 }
 
 func logPipe(prefix string, pipe interface{ Read([]byte) (int, error) }) {
+	logPipeWithObserver(prefix, pipe, nil)
+}
+
+func (s *Session) logOpenConnectPipe(pipe interface{ Read([]byte) (int, error) }) {
+	logPipeWithObserver("openconnect", pipe, func(line string) {
+		if isOpenConnectAuthFailureLine(line) {
+			s.openConnectAuthFailed.Store(true)
+		}
+	})
+}
+
+func logPipeWithObserver(prefix string, pipe interface{ Read([]byte) (int, error) }, observe func(string)) {
 	scanner := bufio.NewScanner(pipe)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line != "" {
+			if observe != nil {
+				observe(line)
+			}
 			log.Printf("%s: %s", prefix, line)
 		}
 	}
+}
+
+func isOpenConnectAuthFailureLine(line string) bool {
+	lower := strings.ToLower(strings.TrimSpace(line))
+	return strings.Contains(lower, "login failed") ||
+		strings.Contains(lower, "failed to complete authentication")
 }
 
 func fileExists(path string) bool {
@@ -625,7 +744,18 @@ type ConfigOptions struct {
 	DirectCIDRs    []string
 	ProtectedCIDRs []string
 	DirectDomains  []string
+	LogLevel       string
 	SplitEnabled   bool
+}
+
+func normalizeSingBoxLogLevel(level string) string {
+	level = strings.ToLower(strings.TrimSpace(level))
+	switch level {
+	case "trace", "debug", "info", "warn", "error", "fatal", "panic":
+		return level
+	default:
+		return "warn"
+	}
 }
 
 func BuildSingBoxConfig(opts ConfigOptions) ([]byte, error) {
@@ -669,6 +799,11 @@ func BuildSingBoxConfig(opts ConfigOptions) ([]byte, error) {
 			})
 		}
 	}
+	rules = append(rules, map[string]any{
+		"network": "udp",
+		"port":    443,
+		"action":  "reject",
+	})
 
 	// Build DNS configuration
 	dnsServers := []map[string]any{
@@ -709,7 +844,7 @@ func BuildSingBoxConfig(opts ConfigOptions) ([]byte, error) {
 
 	config := map[string]any{
 		"log": map[string]any{
-			"level": "info",
+			"level": normalizeSingBoxLogLevel(opts.LogLevel),
 		},
 		"dns": dnsConfig,
 		"inbounds": []map[string]any{

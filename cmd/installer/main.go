@@ -25,6 +25,13 @@ const (
 	hideWindowFlag = 0x08000000
 )
 
+const (
+	shortcutName         = "分流守卫.lnk"
+	legacyShortcutName   = "Split Tunnel.lnk"
+	shortcutIconFileName = "app-shortcut.ico"
+	shortcutDescription  = "分流守卫"
+)
+
 //go:embed payload/**
 var payload embed.FS
 
@@ -64,6 +71,12 @@ func handleCommand(args []string) bool {
 		}
 	case "--has-cisco":
 		if hasCiscoClient() {
+			os.Exit(0)
+		}
+		os.Exit(2)
+	case "--has-bundled-tun-tools":
+		err = requireArg(args, 2, "missing install directory")
+		if err == nil && hasBundledTunTools(args[1]) {
 			os.Exit(0)
 		}
 		os.Exit(2)
@@ -240,6 +253,19 @@ func hasCiscoClient() bool {
 	return config.DetectVPNCLIPath() != ""
 }
 
+func hasBundledTunTools(installDir string) bool {
+	for _, rel := range []string{
+		filepath.Join("openconnect", "openconnect.exe"),
+		filepath.Join("tools", "sing-box.exe"),
+	} {
+		info, err := os.Stat(filepath.Join(installDir, rel))
+		if err != nil || info.IsDir() {
+			return false
+		}
+	}
+	return true
+}
+
 func bundledCiscoInstallers() ([]string, error) {
 	var installers []string
 	err := fs.WalkDir(payload, "payload/cisco", func(path string, d fs.DirEntry, err error) error {
@@ -286,12 +312,8 @@ func extractBundledCisco(outDir string) error {
 }
 
 func createShortcuts(appPath, installDir string) error {
-	iconPath := filepath.Join(installDir, "app.ico")
-	shortcutTargets := []string{
-		filepath.Join(os.Getenv("PUBLIC"), "Desktop", "Split Tunnel.lnk"),
-		filepath.Join(os.Getenv("ProgramData"), "Microsoft", "Windows", "Start Menu", "Programs", "Split Tunnel.lnk"),
-	}
-	for _, shortcut := range shortcutTargets {
+	iconPath := shortcutIconPath(installDir)
+	for _, shortcut := range shortcutTargets(os.Getenv("PUBLIC"), os.Getenv("ProgramData")) {
 		if shortcut == "" {
 			continue
 		}
@@ -302,16 +324,45 @@ func createShortcuts(appPath, installDir string) error {
 			return err
 		}
 	}
+	cleanupLegacyShortcuts(os.Getenv("PUBLIC"), os.Getenv("ProgramData"))
 	return nil
+}
+
+func shortcutTargets(publicDir, programData string) []string {
+	return []string{
+		filepath.Join(publicDir, "Desktop", shortcutName),
+		filepath.Join(programData, "Microsoft", "Windows", "Start Menu", "Programs", shortcutName),
+	}
+}
+
+func legacyShortcutTargets(publicDir, programData string) []string {
+	return []string{
+		filepath.Join(publicDir, "Desktop", legacyShortcutName),
+		filepath.Join(programData, "Microsoft", "Windows", "Start Menu", "Programs", legacyShortcutName),
+	}
+}
+
+func shortcutIconPath(installDir string) string {
+	return filepath.Join(installDir, shortcutIconFileName)
+}
+
+func cleanupLegacyShortcuts(publicDir, programData string) {
+	for _, shortcut := range legacyShortcutTargets(publicDir, programData) {
+		if shortcut == "" {
+			continue
+		}
+		_ = os.Remove(shortcut)
+	}
 }
 
 func createShortcut(shortcut, target, workDir, icon string) error {
 	script := fmt.Sprintf(
-		`$ws = New-Object -ComObject WScript.Shell; $sc = $ws.CreateShortcut(%s); $sc.TargetPath = %s; $sc.WorkingDirectory = %s; $sc.IconLocation = %s; $sc.Description = 'AnyConnect Split Tunnel'; $sc.Save()`,
+		`$ws = New-Object -ComObject WScript.Shell; $sc = $ws.CreateShortcut(%s); $sc.TargetPath = %s; $sc.WorkingDirectory = %s; $sc.IconLocation = %s; $sc.Description = %s; $sc.Save()`,
 		psQuote(shortcut),
 		psQuote(target),
 		psQuote(workDir),
-		psQuote(icon),
+		psQuote(icon+",0"),
+		psQuote(shortcutDescription),
 	)
 	cmd := exec.Command("powershell", "-NoProfile", "-Command", script)
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: hideWindowFlag}
@@ -361,16 +412,35 @@ function Invoke-InstallerCommand {
         [Parameter(Mandatory=$true)][string[]]$Arguments,
         [Parameter(Mandatory=$true)][string]$FailureMessage
     )
-    $argLine = ($Arguments | ForEach-Object { '"' + ($_.Replace('"', '\"')) + '"' }) -join ' '
-    $p = Start-Process -FilePath $InstallerPath -ArgumentList $argLine -Wait -PassThru -WindowStyle Hidden
-    if ($p.ExitCode -ne 0) {
+    $exitCode = Invoke-InstallerExitCode -Arguments $Arguments
+    if ($exitCode -ne 0) {
         throw $FailureMessage
     }
 }
 
+function Invoke-InstallerExitCode {
+    param(
+        [Parameter(Mandatory=$true)][string[]]$Arguments
+    )
+    $argLine = ($Arguments | ForEach-Object { '"' + ($_.Replace('"', '\"')) + '"' }) -join ' '
+    $p = Start-Process -FilePath $InstallerPath -ArgumentList $argLine -Wait -PassThru -WindowStyle Hidden
+    return $p.ExitCode
+}
+
 function Test-CiscoInstalled {
-    $p = Start-Process -FilePath $InstallerPath -ArgumentList '--has-cisco' -Wait -PassThru -WindowStyle Hidden
-    return $p.ExitCode -eq 0
+    return (Invoke-InstallerExitCode -Arguments @('--has-cisco')) -eq 0
+}
+
+function Test-BundledTunToolsReady($installDir) {
+    return (Invoke-InstallerExitCode -Arguments @('--has-bundled-tun-tools', $installDir)) -eq 0
+}
+
+function Start-InstalledApp($installDir) {
+    $appPath = Join-Path $installDir 'anyconnect-split.exe'
+    if (!(Test-Path -LiteralPath $appPath)) {
+        throw '未找到已安装的主程序。'
+    }
+    Start-Process -FilePath $appPath -WorkingDirectory $installDir -WindowStyle Hidden | Out-Null
 }
 
 function Normalize-InstallPath($path) {
@@ -408,7 +478,7 @@ $form.Controls.Add($title)
 $subtitle = New-Object System.Windows.Forms.Label
 $subtitle.Location = New-Object System.Drawing.Point(28, 62)
 $subtitle.Size = New-Object System.Drawing.Size(540, 42)
-$subtitle.Text = '选择安装位置。若本机没有 Cisco 客户端，安装过程中会打开 Cisco 官方安装窗口，请按提示完成。'
+$subtitle.Text = '选择安装位置。安装包已内置 OpenConnect、sing-box 和 IP 库，通常不需要额外安装其他软件。'
 $subtitle.ForeColor = [System.Drawing.Color]::FromArgb(71, 85, 105)
 $form.Controls.Add($subtitle)
 
@@ -496,9 +566,16 @@ function Invoke-InstallSteps($installDir) {
     Set-InstallProgress 8 '正在准备安装目录...'
     Invoke-InstallerCommand -Arguments @('--install-payload', $installDir) -FailureMessage '安装主程序失败。'
 
-    Set-InstallProgress 35 '主程序安装完成，正在检查 Cisco 客户端...'
-    $hasCisco = Test-CiscoInstalled
-    if (-not $hasCisco) {
+    Set-InstallProgress 35 '主程序安装完成，正在检查内置连接组件...'
+    $hasBundledTun = Test-BundledTunToolsReady $installDir
+    $hasCisco = $false
+    if ($hasBundledTun) {
+        Set-InstallProgress 55 '已检测到内置 OpenConnect 和 sing-box，将直接使用自带连接环境。'
+    } else {
+        Set-InstallProgress 42 '未检测到完整内置连接组件，正在检查 Cisco 客户端...'
+        $hasCisco = Test-CiscoInstalled
+    }
+    if ((-not $hasBundledTun) -and (-not $hasCisco)) {
         Set-InstallProgress 45 '正在释放 Cisco 官方安装包...'
         $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ('anyconnect-cisco-' + [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
@@ -529,7 +606,7 @@ function Invoke-InstallSteps($installDir) {
     Set-InstallProgress 82 '正在创建桌面和开始菜单快捷方式...'
     Invoke-InstallerCommand -Arguments @('--create-shortcuts', $installDir) -FailureMessage '创建快捷方式失败。'
     Set-InstallProgress 94 '正在启动程序...'
-    Invoke-InstallerCommand -Arguments @('--start-app', $installDir) -FailureMessage '启动程序失败。'
+    Start-InstalledApp $installDir
     Set-InstallProgress 100 '安装完成，登录窗口稍后会打开。请使用你自己的 VPN 账号密码登录。'
 }
 

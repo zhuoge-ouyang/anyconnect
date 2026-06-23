@@ -1,6 +1,6 @@
 # 打包安装器
 
-默认打包命令会生成一个干净的安装器，不会包含本机账号、密码、日志或已写入路由记录。
+默认打包命令会生成一个干净的自包含安装器，不会包含本机账号、密码、日志或已写入路由记录。
 
 ```powershell
 PowerShell -ExecutionPolicy Bypass -File tools\package.ps1
@@ -14,7 +14,9 @@ artifacts\AnyConnectSplitTunnelSetup.exe
 
 ## 打包 Cisco 客户端
 
-当前程序依赖 Cisco AnyConnect 的 `vpncli.exe` 和 `vpnagent` 服务。只拷贝 `vpncli.exe` 不够，因为还需要 Cisco 的驱动和服务。
+默认安装包会内置 OpenConnect、sing-box、wintun.dll 和 `data\china_ip_list.txt`，朋友电脑安装后通常不需要额外安装 Cisco 客户端。
+
+如果需要保留 Cisco 静态路由后端，程序仍支持检测本机 Cisco AnyConnect / Cisco Secure Client 的 `vpncli.exe` 和 `vpnagent` 服务。只拷贝 `vpncli.exe` 不够，因为还需要 Cisco 的驱动和服务。
 
 如果你有合法授权的 Cisco Core VPN 官方 MSI，可以把它一并打进安装器：
 
@@ -28,6 +30,7 @@ PowerShell -ExecutionPolicy Bypass -File tools\package.ps1 -CiscoInstallerPath "
 
 - 选择安装位置
 - 显示安装进度
+- 自带 OpenConnect + sing-box 连接环境时跳过 Cisco 安装
 - Cisco 客户端使用官方安装界面
 
 ## 隐私

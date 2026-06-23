@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestDefaultConfigIncludesVPNSites(t *testing.T) {
 	cfg := DefaultConfig()
@@ -19,8 +22,14 @@ func TestDefaultConfigIncludesVPNSites(t *testing.T) {
 	if cfg.TrafficBackend != TrafficBackendAuto {
 		t.Fatalf("DefaultConfig().TrafficBackend = %q, want auto", cfg.TrafficBackend)
 	}
+	if cfg.LogLevel != "warn" {
+		t.Fatalf("DefaultConfig().LogLevel = %q, want warn", cfg.LogLevel)
+	}
 	if len(cfg.CodexCandidateSites) == 0 {
 		t.Fatal("DefaultConfig().CodexCandidateSites is empty")
+	}
+	if strings.Contains(cfg.CodexCandidateSites[0], "国内") {
+		t.Fatalf("DefaultConfig().CodexCandidateSites[0] = %q, want global site first", cfg.CodexCandidateSites[0])
 	}
 }
 
@@ -120,5 +129,17 @@ func TestNormalizeTrafficBackend(t *testing.T) {
 				t.Fatalf("TrafficBackend = %q, want %q", cfg.TrafficBackend, tt.want)
 			}
 		})
+	}
+}
+
+func TestNormalizeUsesGlobalCodexCandidatesWhenMissing(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CodexCandidateSites = nil
+	cfg.normalize()
+	if len(cfg.CodexCandidateSites) == 0 {
+		t.Fatal("normalize() CodexCandidateSites is empty")
+	}
+	if strings.Contains(cfg.CodexCandidateSites[0], "国内") {
+		t.Fatalf("normalize() CodexCandidateSites[0] = %q, want global site first", cfg.CodexCandidateSites[0])
 	}
 }

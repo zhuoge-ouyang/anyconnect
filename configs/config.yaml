@@ -39,17 +39,81 @@ codex_auto_select: true
 codex_preferred_site: "23.澳大利亚"
 codex_probe_attempts: 2
 codex_candidate_sites:
-  - "03.国内专线-深圳节点"
-  - "05.国内专线-贵州节点"
-  - "20.泰国"
-  - "21.韩国"
-  - "22.日本"
   - "23.澳大利亚"
+  - "22.日本"
+  - "21.韩国"
+  - "20.泰国"
   - "25.英国"
   - "24.美国"
 
 # Optional host-route exceptions. Leave empty unless a specific domestic domain must bypass VPN.
-domestic_domain_exceptions: []
+domestic_domain_exceptions:
+  # QQ / TIM / 微信
+  - "qq.com"            # 腾讯主域名，覆盖QQ、TIM、微信视频等
+  - "wechat.com"        # 微信国际域名
+  - "weixin.qq.com"     # 微信核心服务
+  - "qpic.cn"           # 微信图片CDN
+  - "myqcloud.com"      # 腾讯云CDN（微信视频常用）
+  - "gtimg.cn"          # 腾讯静态资源CDN
+  - "idqqimg.com"       # QQ图片/视频CDN
+  - "qlogo.cn"          # 头像CDN
+  # 企业微信
+  - "qywechat.com"      # 企业微信独立域名
+  # 飞书
+  - "feishu.cn"         # 飞书主域名
+  - "larksuite.com"     # 飞书国际版
+  - "larkcdn.com"       # 飞书CDN
+  - "bytedance.com"     # 字节跳动服务
+  - "byteimg.com"       # 字节跳动图片CDN
+  # 钉钉
+  - "dingtalk.com"      # 钉钉主域名
+  - "alicdn.com"        # 阿里CDN（钉钉资源）
+  # 花生壳
+  - "oray.com"          # 花生壳/向日葵主域名
+  - "oray.net"          # 备用域名
+  # 腾讯会议
+  - "tencent.com"       # 腾讯主域名（覆盖 meeting.tencent.com 等）
+  - "wemeet.app"        # 腾讯会议独立域名
+  # 哔哩哔哩
+  - "bilibili.com"      # B站主域名
+  - "bilivideo.com"     # B站视频CDN
+  - "hdslb.com"         # B站静态资源CDN
+  - "b23.tv"            # B站短链域名
+  # 电商
+  - "jd.com"            # 京东主域名
+  - "360buyimg.com"     # 京东图片/静态资源
+  - "taobao.com"        # 淘宝主域名
+  - "tmall.com"         # 天猫主域名
+  - "mmstat.com"        # 淘宝/天猫统计与埋点
+  - "tbcdn.cn"          # 淘宝 CDN
+  # 房产
+  - "ke.com"            # 贝壳找房
+  - "lianjia.com"       # 链家
+  - "fang.com"          # 房天下
+  - "soufun.com"        # 搜房/房天下旧域名
+  - "centaline.com.cn"  # 中原中国
+  - "centalines.com"    # 中原集团
+  - "centanet.com"      # 中原地产
+  # 抖音
+  - "douyin.com"        # 抖音主域名
+  - "douyinpic.com"     # 抖音图片CDN
+  - "douyinvod.com"     # 抖音视频CDN
+  - "amemv.com"         # 抖音短视频旧域名
+  # Steam / 蒸汽平台
+  - "steampowered.com"   # Steam 主域名
+  - "steamcommunity.com" # Steam 社区
+  - "steamcontent.com"   # Steam 内容CDN
+  - "steamstatic.com"    # Steam 静态资源
+  - "steam-chat.com"     # Steam 聊天
+  - "steamgames.com"     # Steam 游戏
+  # 原神 / 米哈游
+  - "mihoyo.com"         # 米哈游主域名
+  - "hoyoverse.com"      # HoYoverse（米哈游海外品牌）
+  - "yuanshen.com"       # 原神官网
+  - "hoyolab.com"        # 米哈游社区
+  - "bhsr.com"           # 崩坏：星穹铁道
+  # 11对战平台
+  - "5211game.com"       # 11对战平台主域名
 
 # IP database update interval (days)
 update_interval_days: 7

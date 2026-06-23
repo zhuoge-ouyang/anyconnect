@@ -40,6 +40,18 @@ if ($parseErrors.Count -gt 0) {
 	}
 }
 
+func TestDashboardScriptDoesNotDrawDecorativeDiagonalLines(t *testing.T) {
+	script := dashboardScript(
+		`C:\Temp\anyconnect-dashboard-state.json`,
+		`C:\Temp\anyconnect-dashboard-commands`,
+		`C:\Temp\app.ico`,
+	)
+
+	if strings.Contains(script, ".DrawLine(") {
+		t.Fatal("dashboard script should not draw decorative background lines")
+	}
+}
+
 func writeUTF16LE(path, text string) error {
 	encoded := utf16.Encode([]rune(text))
 	data := make([]byte, 2+len(encoded)*2)

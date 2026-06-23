@@ -28,6 +28,36 @@ func psSingleQuoted(s string) string {
 	return strings.ReplaceAll(s, "'", "''")
 }
 
+func loginDefaultSite(sites []Site, preferredSite string) string {
+	preferredSite = strings.TrimSpace(preferredSite)
+	if preferredSite != "" && !isDomesticLine(preferredSite) {
+		for _, site := range sites {
+			if site.Name == preferredSite || strings.Contains(site.Name, preferredSite) {
+				return site.Name
+			}
+		}
+		return preferredSite
+	}
+	for _, hint := range []string{"澳大利亚", "日本", "韩国", "泰国", "英国", "美国", "加拿大", "香港", "台湾"} {
+		for _, site := range sites {
+			if strings.Contains(site.Name, hint) {
+				return site.Name
+			}
+		}
+	}
+	if preferredSite != "" {
+		return preferredSite
+	}
+	if len(sites) > 0 {
+		return sites[0].Name
+	}
+	return ""
+}
+
+func isDomesticLine(siteName string) bool {
+	return strings.Contains(siteName, "国内专线")
+}
+
 // ShowLoginDialog 弹出登录窗口。
 func ShowLoginDialog(sites []Site, preferredSite, savedUsername string, rememberDefault bool) LoginResult {
 	resultFile, err := os.CreateTemp("", "anyconnect-login-*.json")
@@ -45,6 +75,7 @@ func ShowLoginDialog(sites []Site, preferredSite, savedUsername string, remember
 	}
 	sitesStr := strings.Join(sitesParts, ";")
 	sitesStr = psSingleQuoted(sitesStr)
+	preferredSite = loginDefaultSite(sites, preferredSite)
 	preferredSite = psSingleQuoted(preferredSite)
 	savedUsername = psSingleQuoted(savedUsername)
 	exePath, _ := os.Executable()
@@ -125,6 +156,7 @@ $panelAlt = [System.Drawing.Color]::FromArgb(18, 28, 38)
 $form.Add_Paint({
     param($sender, $e)
     $rect = $sender.ClientRectangle
+    if ($rect.Width -le 0 -or $rect.Height -le 0) { return }
     $brush = [System.Drawing.Drawing2D.LinearGradientBrush]::new(
         $rect,
         [System.Drawing.Color]::FromArgb(7, 13, 19),

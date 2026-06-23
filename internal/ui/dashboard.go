@@ -56,11 +56,20 @@ public static class DashboardFocusNative {
     public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll")]
     public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
 }
 "@
 $hwnd = [DashboardFocusNative]::FindWindow($null, '` + title + `')
 if ($hwnd -ne [IntPtr]::Zero) {
     [DashboardFocusNative]::ShowWindow($hwnd, 9) | Out-Null
+    $HWND_TOPMOST = [IntPtr]::new(-1)
+    $HWND_NOTOPMOST = [IntPtr]::new(-2)
+    $SWP_NOMOVE = 0x0002
+    $SWP_NOSIZE = 0x0001
+    $SWP_SHOWWINDOW = 0x0040
+    [DashboardFocusNative]::SetWindowPos($hwnd, $HWND_TOPMOST, 0, 0, 0, 0, $SWP_NOMOVE -bor $SWP_NOSIZE -bor $SWP_SHOWWINDOW) | Out-Null
+    [DashboardFocusNative]::SetWindowPos($hwnd, $HWND_NOTOPMOST, 0, 0, 0, 0, $SWP_NOMOVE -bor $SWP_NOSIZE -bor $SWP_SHOWWINDOW) | Out-Null
     [DashboardFocusNative]::SetForegroundWindow($hwnd) | Out-Null
 }
 `
@@ -79,6 +88,19 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
+
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class DashboardForeNative {
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+}
+"@
 
 $snapshotPath = '__SNAPSHOT_PATH__'
 $commandDir = '__COMMAND_DIR__'
@@ -194,6 +216,8 @@ $form.MinimumSize = [System.Drawing.Size]::new(820, 600)
 $form.BackColor = [System.Drawing.Color]::FromArgb(230, 239, 244)
 $form.Font = New-Font 9
 $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
+$form.ShowInTaskbar = $true
+$form.TopMost = $true
 if (Test-Path $iconPath) {
     $form.Icon = [System.Drawing.Icon]::new($iconPath)
 }
@@ -201,6 +225,7 @@ if (Test-Path $iconPath) {
 $form.Add_Paint({
     param($sender, $e)
     $rect = $sender.ClientRectangle
+    if ($rect.Width -le 0 -or $rect.Height -le 0) { return }
     $brush = [System.Drawing.Drawing2D.LinearGradientBrush]::new(
         $rect,
         [System.Drawing.Color]::FromArgb(244, 250, 252),
@@ -209,11 +234,6 @@ $form.Add_Paint({
     )
     $e.Graphics.FillRectangle($brush, $rect)
     $brush.Dispose()
-    $pen = [System.Drawing.Pen]::new([System.Drawing.Color]::FromArgb(232, 242, 246), 1)
-    for ($x = -120; $x -lt $rect.Width; $x += 52) {
-        $e.Graphics.DrawLine($pen, $x, 0, $x + 220, $rect.Height)
-    }
-    $pen.Dispose()
 })
 
 $header = New-Panel 24 22 816 118 $paper
@@ -367,12 +387,28 @@ $chkAuto.Add_CheckedChanged({ if (-not $script:hydrating) { Write-Command 'toggl
 $timer = [System.Windows.Forms.Timer]::new()
 $timer.Interval = 1000
 $timer.Add_Tick({ Refresh-State })
+
+$unTopTimer = [System.Windows.Forms.Timer]::new()
+$unTopTimer.Interval = 400
+$unTopTimer.Add_Tick({
+    $form.TopMost = $false
+    $unTopTimer.Stop()
+})
+
 $form.Add_Shown({
     Refresh-State
     $timer.Start()
+    $form.WindowState = [System.Windows.Forms.FormWindowState]::Normal
     $form.Activate()
+    $form.BringToFront()
+    [DashboardForeNative]::ShowWindow($form.Handle, 9) | Out-Null
+    [DashboardForeNative]::SetForegroundWindow($form.Handle) | Out-Null
+    $unTopTimer.Start()
 })
-$form.Add_FormClosed({ $timer.Stop() })
+$form.Add_FormClosed({
+    $timer.Stop()
+    $unTopTimer.Stop()
+})
 
 [void]$form.ShowDialog()
 `
