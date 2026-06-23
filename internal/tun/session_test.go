@@ -276,7 +276,7 @@ func TestWaitForVPNInterfaceReturnsAuthFailureWhenOpenConnectRejectsLogin(t *tes
 
 func TestWaitForSingBoxDoesNotAcceptStaleInterfaceWhenProcessExits(t *testing.T) {
 	ifaceName := firstInterfaceName(t)
-	cmd := exec.Command("cmd", "/C", "ping -n 2 127.0.0.1 >NUL & exit /B 1")
+	cmd := exec.Command("cmd", "/C", "exit /B 1")
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start short-lived command: %v", err)
 	}
