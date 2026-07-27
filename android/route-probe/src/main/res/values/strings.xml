@@ -1,0 +1,28 @@
+<resources>
+    <string name="app_name">AnyConnect 路由探针</string>
+    <string name="probe_title">Android VPN 白名单路由探针</string>
+    <string name="probe_warning">此工具只验证小白名单路由容量与数据路径，不是最终 VPN 客户端。</string>
+    <string name="device_summary">设备：%1$s\nAndroid SDK：%2$d</string>
+    <string name="start_full_probe">开始完整探针</string>
+    <string name="copy_report">复制报告</string>
+    <string name="stop_and_close_vpn">停止并关闭 VPN</string>
+    <string name="initial_status">等待开始探针。</string>
+    <string name="checking_permissions">正在检查通知与 VPN 权限…</string>
+    <string name="requesting_notification_permission">请允许通知权限，以便运行前台 VPN 探针。</string>
+    <string name="notification_permission_denied">通知权限未授予，探针已停止。</string>
+    <string name="helper_warmup_requested">已尝试唤醒辅助探针。</string>
+    <string name="helper_warmup_failed">辅助探针唤醒失败：%1$s</string>
+    <string name="requesting_vpn_permission">请确认 Android VPN 授权。</string>
+    <string name="vpn_permission_denied">VPN 授权未通过，探针已停止。</string>
+    <string name="service_started">前台探针服务已启动。</string>
+    <string name="probe_complete">探针完成。</string>
+    <string name="active_report_restored">探针完成，已从本机报告恢复完整结果。</string>
+    <string name="recent_report_restored">最近一次已完成报告（从本机恢复）。</string>
+    <string name="probe_failed">探针失败，不会自动重试：</string>
+    <string name="report_file_path">报告文件：%1$s</string>
+    <string name="missing_report_json">服务完成结果缺少完整报告 JSON。</string>
+    <string name="missing_failure_message">服务未返回错误类与消息。</string>
+    <string name="report_clip_label">AnyConnect 路由探针报告</string>
+    <string name="report_copied">完整报告 JSON 已复制。</string>
+    <string name="stop_requested">已请求停止服务并关闭 VPN。</string>
+</resources>

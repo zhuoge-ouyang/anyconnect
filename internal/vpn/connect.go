@@ -16,6 +16,10 @@ import (
 // vpnui.exe 运行时会阻止 vpncli -s 建立新连接
 // 残留的 vpncli.exe 也会导致 "Connect not available" 错误
 func killConflictingProcesses() {
+	killConflictingProcessesContext(context.Background())
+}
+
+func killConflictingProcessesContext(ctx context.Context) {
 	for _, proc := range []string{"vpnui.exe", "vpncli.exe"} {
 		cmd := exec.Command("taskkill", "/F", "/IM", proc)
 		cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x08000000}
@@ -24,11 +28,18 @@ func killConflictingProcesses() {
 		}
 	}
 	// 等待进程完全退出
-	time.Sleep(2 * time.Second)
+	select {
+	case <-time.After(2 * time.Second):
+	case <-ctx.Done():
+	}
 }
 
 func runHiddenWithTimeout(timeout time.Duration, name string, args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	return runHiddenWithContextTimeout(context.Background(), timeout, name, args...)
+}
+
+func runHiddenWithContextTimeout(parent context.Context, timeout time.Duration, name string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, name, args...)
@@ -41,8 +52,12 @@ func runHiddenWithTimeout(timeout time.Duration, name string, args ...string) ([
 }
 
 func ensureAgentService() error {
+	return ensureAgentServiceContext(context.Background())
+}
+
+func ensureAgentServiceContext(ctx context.Context) error {
 	// 快速检查：服务已运行则立即返回（绝大多数正常场景走这里，<1秒）
-	if output, err := runHiddenWithTimeout(3*time.Second, "sc", "query", "vpnagent"); err == nil {
+	if output, err := runHiddenWithContextTimeout(ctx, 3*time.Second, "sc", "query", "vpnagent"); err == nil {
 		if strings.Contains(strings.ToUpper(string(output)), "RUNNING") {
 			return nil
 		}
@@ -50,13 +65,17 @@ func ensureAgentService() error {
 
 	// 服务未运行，尝试启动
 	log.Println("vpnagent service not running, attempting to start...")
-	runHiddenWithTimeout(5*time.Second, "net", "start", "vpnagent")
+	_, _ = runHiddenWithContextTimeout(ctx, 5*time.Second, "net", "start", "vpnagent")
 
 	// 轮询等待服务启动，最多15秒
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		time.Sleep(1 * time.Second)
-		if output, err := runHiddenWithTimeout(3*time.Second, "sc", "query", "vpnagent"); err == nil {
+		select {
+		case <-time.After(time.Second):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if output, err := runHiddenWithContextTimeout(ctx, 3*time.Second, "sc", "query", "vpnagent"); err == nil {
 			if strings.Contains(strings.ToUpper(string(output)), "RUNNING") {
 				log.Println("vpnagent service started successfully")
 				return nil
@@ -77,20 +96,28 @@ func hasVPNNetworkEvidence() bool {
 // PrepareForNewConnection clears a previous Cisco UI/CLI session before this
 // app records the local gateway and starts its own VPN connection.
 func PrepareForNewConnection(cliPath string) {
-	if err := ensureAgentService(); err != nil {
+	PrepareForNewConnectionContext(context.Background(), cliPath)
+}
+
+func PrepareForNewConnectionContext(ctx context.Context, cliPath string) {
+	if err := ensureAgentServiceContext(ctx); err != nil {
 		log.Printf("Warning: could not ensure vpnagent service: %v", err)
 	}
 	if cliPath != "" {
-		if err := Disconnect(cliPath); err != nil {
+		if err := DisconnectContext(ctx, cliPath); err != nil {
 			log.Printf("Pre-connect disconnect ignored: %v", err)
 		}
 	}
-	killConflictingProcesses()
+	killConflictingProcessesContext(ctx)
 }
 
 // statusCheckWithTimeout 在独立 goroutine 中运行状态检查，确保不会阻塞调用方
 func statusCheckWithTimeout(cliPath string, timeout time.Duration) (bool, error) {
-	connected, output, err := statusWithOutput(cliPath, timeout)
+	return statusCheckWithContext(context.Background(), cliPath, timeout)
+}
+
+func statusCheckWithContext(parent context.Context, cliPath string, timeout time.Duration) (bool, error) {
+	connected, output, err := statusWithOutputContext(parent, cliPath, timeout)
 	if connected {
 		return true, nil
 	}
@@ -105,13 +132,22 @@ func statusCheckWithTimeout(cliPath string, timeout time.Duration) (bool, error)
 }
 
 func Connect(cliPath, server, username, password string) error {
-	if err := ensureAgentService(); err != nil {
+	return ConnectContext(context.Background(), cliPath, server, username, password)
+}
+
+// ConnectContext establishes a Cisco connection while honoring the caller's
+// deadline. The legacy Connect entry point intentionally keeps its old API.
+func ConnectContext(ctx context.Context, cliPath, server, username, password string) error {
+	if err := ensureAgentServiceContext(ctx); err != nil {
 		return fmt.Errorf("Cisco VPN 后台服务 vpnagent 未运行：%w", err)
 	}
 	// 先杀掉 vpnui.exe，避免 "Another AnyConnect application is running" 错误
-	killConflictingProcesses()
+	killConflictingProcessesContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
-	cmd := exec.Command(cliPath, "-s")
+	cmd := exec.CommandContext(ctx, cliPath, "-s")
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x08000000}
 
 	stdin, err := cmd.StdinPipe()
@@ -133,7 +169,11 @@ func Connect(cliPath, server, username, password string) error {
 	// 我们通过独立调用 vpncli status 来检查是否连接成功
 
 	// 先等几秒让连接建立
-	time.Sleep(5 * time.Second)
+	select {
+	case <-time.After(5 * time.Second):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 
 	// 使用硬性截止时间，确保无论状态检查是否阻塞都能超时退出
 	deadline := time.Now().Add(90 * time.Second)
@@ -141,15 +181,24 @@ func Connect(cliPath, server, username, password string) error {
 	defer ticker.Stop()
 
 	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		if time.Now().After(deadline) {
 			cmd.Process.Kill()
 			log.Println("VPN connection timed out after 90s")
 			return fmt.Errorf("VPN 连接超时（90秒），请检查网络或换个节点重试")
 		}
 
-		<-ticker.C
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 		// 使用带超时的状态检查，防止 vpncli status 挂起阻塞整个循环
-		connected, err := statusCheckWithTimeout(cliPath, 8*time.Second)
+		connected, err := statusCheckWithContext(ctx, cliPath, 8*time.Second)
 		if err != nil {
 			log.Printf("Status check error (will retry): %v", err)
 			continue
@@ -164,20 +213,24 @@ func Connect(cliPath, server, username, password string) error {
 }
 
 func Disconnect(cliPath string) error {
+	return DisconnectContext(context.Background(), cliPath)
+}
+
+func DisconnectContext(parent context.Context, cliPath string) error {
 	if cliPath == "" {
 		return nil
 	}
-	if err := ensureAgentService(); err != nil {
+	if err := ensureAgentServiceContext(parent); err != nil {
 		log.Printf("Warning: disconnect without running vpnagent service: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 20*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, cliPath, "disconnect")
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x08000000}
 	output, err := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
-		killConflictingProcesses()
+		killConflictingProcessesContext(parent)
 		return fmt.Errorf("disconnect timed out")
 	}
 	if err != nil {
@@ -257,7 +310,11 @@ func statusPresenceFromOutput(output string) (monitor.VPNPresence, bool) {
 
 // statusWithOutput 返回连接状态和原始输出（用于诊断）
 func statusWithOutput(cliPath string, timeout time.Duration) (bool, string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	return statusWithOutputContext(context.Background(), cliPath, timeout)
+}
+
+func statusWithOutputContext(parent context.Context, cliPath string, timeout time.Duration) (bool, string, error) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, cliPath, "status")

@@ -36,6 +36,7 @@ saved_username: ""
 
 # Codex stable mode tests these sites in order, then picks the fastest healthy one.
 codex_auto_select: true
+codex_mode_active: false
 codex_preferred_site: "23.澳大利亚"
 codex_probe_attempts: 2
 codex_candidate_sites:
@@ -46,74 +47,185 @@ codex_candidate_sites:
   - "25.英国"
   - "24.美国"
 
-# Optional host-route exceptions. Leave empty unless a specific domestic domain must bypass VPN.
+# 国内白名单：foreign_direct 模式下这些国内服务直连；也可手动追加域名。
 domestic_domain_exceptions:
-  # QQ / TIM / 微信
-  - "qq.com"            # 腾讯主域名，覆盖QQ、TIM、微信视频等
-  - "wechat.com"        # 微信国际域名
-  - "weixin.qq.com"     # 微信核心服务
-  - "qpic.cn"           # 微信图片CDN
-  - "myqcloud.com"      # 腾讯云CDN（微信视频常用）
-  - "gtimg.cn"          # 腾讯静态资源CDN
-  - "idqqimg.com"       # QQ图片/视频CDN
-  - "qlogo.cn"          # 头像CDN
-  # 企业微信
-  - "qywechat.com"      # 企业微信独立域名
-  # 飞书
-  - "feishu.cn"         # 飞书主域名
-  - "larksuite.com"     # 飞书国际版
-  - "larkcdn.com"       # 飞书CDN
-  - "bytedance.com"     # 字节跳动服务
-  - "byteimg.com"       # 字节跳动图片CDN
-  # 钉钉
-  - "dingtalk.com"      # 钉钉主域名
-  - "alicdn.com"        # 阿里CDN（钉钉资源）
-  # 花生壳
-  - "oray.com"          # 花生壳/向日葵主域名
-  - "oray.net"          # 备用域名
-  # 腾讯会议
-  - "tencent.com"       # 腾讯主域名（覆盖 meeting.tencent.com 等）
-  - "wemeet.app"        # 腾讯会议独立域名
+  # 百度
+  - "baidu.com"
+  - "bdstatic.com"
+  - "bdimg.com"
+  - "baidubce.com"
+  - "hao123.com"
+  # 新浪 / 微博
+  - "sina.com"
+  - "sina.com.cn"
+  - "sinaimg.cn"
+  - "weibo.com"
+  - "weibo.cn"
+  - "t.cn"
+  # 微信 / TIM / 腾讯基础服务
+  - "qq.com"
+  - "wechat.com"
+  - "weixin.qq.com"
+  - "wx.qq.com"
+  - "mp.weixin.qq.com"
+  - "res.wx.qq.com"
+  - "weixin110.qq.com"
+  - "tim.qq.com"
+  - "gtimg.cn"
+  - "gtimg.com"
+  - "qpic.cn"
+  - "idqqimg.com"
+  - "qlogo.cn"
+  - "myqcloud.com"
   # 哔哩哔哩
-  - "bilibili.com"      # B站主域名
-  - "bilivideo.com"     # B站视频CDN
-  - "hdslb.com"         # B站静态资源CDN
-  - "b23.tv"            # B站短链域名
-  # 电商
-  - "jd.com"            # 京东主域名
-  - "360buyimg.com"     # 京东图片/静态资源
-  - "taobao.com"        # 淘宝主域名
-  - "tmall.com"         # 天猫主域名
-  - "mmstat.com"        # 淘宝/天猫统计与埋点
-  - "tbcdn.cn"          # 淘宝 CDN
-  # 房产
-  - "ke.com"            # 贝壳找房
-  - "lianjia.com"       # 链家
-  - "fang.com"          # 房天下
-  - "soufun.com"        # 搜房/房天下旧域名
-  - "centaline.com.cn"  # 中原中国
-  - "centalines.com"    # 中原集团
-  - "centanet.com"      # 中原地产
-  # 抖音
-  - "douyin.com"        # 抖音主域名
-  - "douyinpic.com"     # 抖音图片CDN
-  - "douyinvod.com"     # 抖音视频CDN
-  - "amemv.com"         # 抖音短视频旧域名
-  # Steam / 蒸汽平台
-  - "steampowered.com"   # Steam 主域名
-  - "steamcommunity.com" # Steam 社区
-  - "steamcontent.com"   # Steam 内容CDN
-  - "steamstatic.com"    # Steam 静态资源
-  - "steam-chat.com"     # Steam 聊天
-  - "steamgames.com"     # Steam 游戏
-  # 原神 / 米哈游
-  - "mihoyo.com"         # 米哈游主域名
-  - "hoyoverse.com"      # HoYoverse（米哈游海外品牌）
-  - "yuanshen.com"       # 原神官网
-  - "hoyolab.com"        # 米哈游社区
-  - "bhsr.com"           # 崩坏：星穹铁道
-  # 11对战平台
-  - "5211game.com"       # 11对战平台主域名
+  - "bilibili.com"
+  - "bilibili.tv"
+  - "biligame.com"
+  - "biliapi.net"
+  - "bilivideo.com"
+  - "hdslb.com"
+  - "b23.tv"
+  # 淘宝 / 天猫 / 闲鱼 / 阿里电商
+  - "taobao.com"
+  - "tmall.com"
+  - "tmall.hk"
+  - "goofish.com"
+  - "2.taobao.com"
+  - "alipay.com"
+  - "alicdn.com"
+  - "tbcdn.cn"
+  - "mmstat.com"
+  - "alibaba.com"
+  - "alibaba-inc.com"
+  - "alibabausercontent.com"
+  - "aliyuncs.com"
+  # 京东
+  - "jd.com"
+  - "360buy.com"
+  - "360buyimg.com"
+  - "jdcdn.com"
+  - "jcloud.com"
+  - "jdcloud.com"
+  # 小红书
+  - "xiaohongshu.com"
+  - "xhscdn.com"
+  - "xhslink.com"
+  # 抖音 / 字节
+  - "douyin.com"
+  - "iesdouyin.com"
+  - "douyinpic.com"
+  - "douyinvod.com"
+  - "douyinstatic.com"
+  - "amemv.com"
+  - "snssdk.com"
+  - "bytedance.com"
+  - "byteimg.com"
+  - "bytednsdoc.com"
+  - "toutiao.com"
+  # 拼多多
+  - "pinduoduo.com"
+  - "yangkeduo.com"
+  - "pddpic.com"
+  - "pddcdn.com"
+  # 常用银行
+  - "icbc.com.cn"
+  - "abchina.com"
+  - "boc.cn"
+  - "bankofchina.com"
+  - "ccb.com"
+  - "bankcomm.com"
+  - "psbc.com"
+  - "cmbchina.com"
+  - "cmbc.com.cn"
+  - "cebbank.com"
+  - "citicbank.com"
+  - "spdb.com.cn"
+  - "cib.com.cn"
+  - "hxb.com.cn"
+  - "bank.pingan.com"
+  - "pingan.com"
+  - "cgbchina.com.cn"
+  - "bankofbeijing.com.cn"
+  - "bankofshanghai.com"
+  - "nbcb.com.cn"
+  - "srcb.com"
+  - "hsbank.com.cn"
+  - "czbank.com"
+  - "hrbb.com.cn"
+  # 国内游戏公司
+  - "game.qq.com"
+  - "wegame.com.cn"
+  - "start.qq.com"
+  - "tencent.com"
+  - "163.com"
+  - "netease.com"
+  - "neteasegames.com"
+  - "game.163.com"
+  - "mihoyo.com"
+  - "mhyurl.cn"
+  - "yuanshen.com"
+  - "hoyoverse.com"
+  - "hoyolab.com"
+  - "bhsr.com"
+  - "wanmei.com"
+  - "perfectworld.com"
+  - "37.com"
+  - "4399.com"
+  - "xoyo.com"
+  - "seasunwbl.com"
+  - "ztgame.com"
+  - "youzu.com"
+  - "lilith.com"
+  # 11 对战平台
+  - "5211game.com"
+  - "www.5211game.com"
+
+# 国外 VPN 优先模式下可手动追加的国内 IP/CIDR 白名单。
+domestic_ip_exceptions: []
+
+# 分流模式：
+#   domestic_direct - 默认全部直连，仅国外白名单走 VPN（默认）
+#   foreign_direct  - 默认全部走 VPN，仅国内白名单直连
+split_mode: "domestic_direct"
+
+# 单次静态路由计划最大条数。超过该值会拒绝写入，避免出现 2 万+ 路由卡死。
+route_entry_limit: 2000
+
+# 国内直连模式下走 VPN 的国外域名白名单。
+foreign_domain_exceptions:
+  - "pornhub.com"
+  - "youtube.com"
+  - "ytimg.com"
+  - "google.com"
+  - "googleapis.com"
+  - "googlevideo.com"
+  - "gstatic.com"
+  - "ggpht.com"
+  - "gemini.google.com"
+  - "aistudio.google.com"
+  - "generativelanguage.googleapis.com"
+  - "openai.com"
+  - "chatgpt.com"
+  - "api.openai.com"
+  - "auth.openai.com"
+  - "platform.openai.com"
+  - "cdn.openai.com"
+  - "files.oaiusercontent.com"
+  - "chat.com"
+  - "oaistatic.com"
+  - "oaiusercontent.com"
+  - "anthropic.com"
+  - "claude.ai"
+  - "api.anthropic.com"
+  - "github.com"
+  - "githubusercontent.com"
+  - "githubassets.com"
+  - "githubcopilot.com"
+  - "copilot.microsoft.com"
+  - "gitlab.com"
+  - "gitlab-static.net"
+
+foreign_ip_exceptions: []
 
 # IP database update interval (days)
 update_interval_days: 7

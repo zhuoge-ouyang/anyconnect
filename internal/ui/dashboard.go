@@ -5,23 +5,114 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"unsafe"
 
 	"github.com/user/anyconnect-split/internal/dashboard"
 )
 
 const dashboardWindowTitle = "AnyConnect 分流管理台"
 
-var (
-	dashboardMu  sync.Mutex
-	dashboardCmd *exec.Cmd
+type dashboardLaunchDecision int
+
+const (
+	dashboardLaunchStart dashboardLaunchDecision = iota
+	dashboardLaunchFocus
+	dashboardLaunchWait
 )
+
+var (
+	dashboardMu                       sync.Mutex
+	dashboardCmd                      *exec.Cmd
+	dashboardUser32                   = syscall.NewLazyDLL("user32.dll")
+	dashboardEnumWindows              = dashboardUser32.NewProc("EnumWindows")
+	dashboardGetWindowThreadProcessID = dashboardUser32.NewProc("GetWindowThreadProcessId")
+	dashboardGetWindowText            = dashboardUser32.NewProc("GetWindowTextW")
+	dashboardIsIconic                 = dashboardUser32.NewProc("IsIconic")
+	dashboardShowWindow               = dashboardUser32.NewProc("ShowWindow")
+	dashboardSetForegroundWindow      = dashboardUser32.NewProc("SetForegroundWindow")
+	dashboardSetWindowPos             = dashboardUser32.NewProc("SetWindowPos")
+)
+
+func decideDashboardLaunch(processRunning, windowExists bool) dashboardLaunchDecision {
+	if !processRunning {
+		return dashboardLaunchStart
+	}
+	if windowExists {
+		return dashboardLaunchFocus
+	}
+	return dashboardLaunchWait
+}
+
+func dashboardWindowForProcess(processID int) uintptr {
+	if processID <= 0 {
+		return 0
+	}
+	var found uintptr
+	callback := syscall.NewCallback(func(hwnd, _ uintptr) uintptr {
+		var windowProcessID uint32
+		dashboardGetWindowThreadProcessID.Call(hwnd, uintptr(unsafe.Pointer(&windowProcessID)))
+		if int(windowProcessID) != processID {
+			return 1
+		}
+
+		text := make([]uint16, 256)
+		length, _, _ := dashboardGetWindowText.Call(
+			hwnd,
+			uintptr(unsafe.Pointer(&text[0])),
+			uintptr(len(text)),
+		)
+		if length == 0 || syscall.UTF16ToString(text) != dashboardWindowTitle {
+			return 1
+		}
+		found = hwnd
+		return 0
+	})
+	dashboardEnumWindows.Call(callback, 0)
+	return found
+}
+
+func dashboardWindowIsMinimized(hwnd uintptr) bool {
+	if hwnd == 0 {
+		return false
+	}
+	minimized, _, _ := dashboardIsIconic.Call(hwnd)
+	return minimized != 0
+}
+
+func focusDashboardWindow(hwnd uintptr) {
+	if hwnd == 0 {
+		return
+	}
+	const (
+		swRestore     = 9
+		swpNoSize     = 0x0001
+		swpNoMove     = 0x0002
+		swpShowWindow = 0x0040
+	)
+	hwndTopmost := ^uintptr(0)
+	hwndNoTopmost := ^uintptr(1)
+	flags := uintptr(swpNoSize | swpNoMove | swpShowWindow)
+
+	dashboardShowWindow.Call(hwnd, swRestore)
+	dashboardSetWindowPos.Call(hwnd, hwndTopmost, 0, 0, 0, 0, flags)
+	dashboardSetWindowPos.Call(hwnd, hwndNoTopmost, 0, 0, 0, 0, flags)
+	dashboardSetForegroundWindow.Call(hwnd)
+}
 
 func ShowDashboard(store *dashboard.Store, iconPath string) error {
 	dashboardMu.Lock()
 	defer dashboardMu.Unlock()
 
-	if dashboardCmd != nil && dashboardCmd.ProcessState == nil {
-		focusDashboardWindow()
+	processRunning := dashboardCmd != nil && dashboardCmd.ProcessState == nil
+	var hwnd uintptr
+	if processRunning {
+		hwnd = dashboardWindowForProcess(dashboardCmd.Process.Pid)
+	}
+	switch decideDashboardLaunch(processRunning, hwnd != 0) {
+	case dashboardLaunchFocus:
+		focusDashboardWindow(hwnd)
+		return nil
+	case dashboardLaunchWait:
 		return nil
 	}
 
@@ -41,41 +132,6 @@ func ShowDashboard(store *dashboard.Store, iconPath string) error {
 		dashboardMu.Unlock()
 	}()
 	return nil
-}
-
-func focusDashboardWindow() {
-	title := psSingleQuoted(dashboardWindowTitle)
-	script := `
-Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public static class DashboardFocusNative {
-    [DllImport("user32.dll", CharSet=CharSet.Unicode)]
-    public static extern IntPtr FindWindow(string className, string windowName);
-    [DllImport("user32.dll")]
-    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-    [DllImport("user32.dll")]
-    public static extern bool SetForegroundWindow(IntPtr hWnd);
-    [DllImport("user32.dll")]
-    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
-}
-"@
-$hwnd = [DashboardFocusNative]::FindWindow($null, '` + title + `')
-if ($hwnd -ne [IntPtr]::Zero) {
-    [DashboardFocusNative]::ShowWindow($hwnd, 9) | Out-Null
-    $HWND_TOPMOST = [IntPtr]::new(-1)
-    $HWND_NOTOPMOST = [IntPtr]::new(-2)
-    $SWP_NOMOVE = 0x0002
-    $SWP_NOSIZE = 0x0001
-    $SWP_SHOWWINDOW = 0x0040
-    [DashboardFocusNative]::SetWindowPos($hwnd, $HWND_TOPMOST, 0, 0, 0, 0, $SWP_NOMOVE -bor $SWP_NOSIZE -bor $SWP_SHOWWINDOW) | Out-Null
-    [DashboardFocusNative]::SetWindowPos($hwnd, $HWND_NOTOPMOST, 0, 0, 0, 0, $SWP_NOMOVE -bor $SWP_NOSIZE -bor $SWP_SHOWWINDOW) | Out-Null
-    [DashboardFocusNative]::SetForegroundWindow($hwnd) | Out-Null
-}
-`
-	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script)
-	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x08000000}
-	_ = cmd.Start()
 }
 
 func dashboardScript(snapshotPath, commandDir, iconPath string) string {
@@ -99,12 +155,16 @@ public static class DashboardForeNative {
     public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")]
     public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)]
+    public static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, string lParam);
 }
 "@
 
 $snapshotPath = '__SNAPSHOT_PATH__'
 $commandDir = '__COMMAND_DIR__'
 $iconPath = '__ICON_PATH__'
+$dashboardBgPath = Join-Path ([System.IO.Path]::GetDirectoryName($iconPath)) 'ui-assets\desktop-dashboard-bg.png'
+$contactQrPath = Join-Path ([System.IO.Path]::GetDirectoryName($iconPath)) 'ui-assets\wechat-contact-qr.png'
 New-Item -ItemType Directory -Force -Path $commandDir | Out-Null
 
 function New-Font($size, $style = [System.Drawing.FontStyle]::Regular) {
@@ -170,7 +230,218 @@ function New-Panel($x, $y, $w, $h, $color) {
     return $panel
 }
 
-function Write-Command($action, $enabled = $null) {
+function Show-RechargeDialog($owner) {
+    $dialog = [System.Windows.Forms.Form]::new()
+    $dialog.Text = '账号充值说明'
+    $dialog.Size = [System.Drawing.Size]::new(680, 650)
+    $dialog.StartPosition = 'CenterParent'
+    $dialog.FormBorderStyle = 'FixedDialog'
+    $dialog.MaximizeBox = $false
+    $dialog.MinimizeBox = $false
+    $dialog.BackColor = [System.Drawing.Color]::FromArgb(255, 253, 242)
+    $dialog.Font = New-Font 9
+    if (Test-Path $iconPath) {
+        $dialog.Icon = [System.Drawing.Icon]::new($iconPath)
+    }
+
+    $title = New-Label 24 18 610 34 '线上购买与充值流程' 16 ([System.Drawing.Color]::FromArgb(48, 84, 53)) ([System.Drawing.FontStyle]::Bold)
+    $dialog.Controls.Add($title)
+
+    $infoText = @'
+【一、套餐价格】
+
+40 元 / 1 个月
+180 元 / 半年
+240 元 / 1 年
+400 元 / 2 年
+520 元 / 3 年
+
+【二、购买须知】
+
+• 支持苹果、安卓、Mac、Windows 等主流平台。
+• 不限制安装绑定设备数量，但同时使用数量不超过 2 台。
+• 合理使用不限流量。
+• 不提供试用，不支持退款。购买前请先向推荐人详细了解产品。
+
+【三、注册账号】
+
+1. 打开浏览器（建议使用设备自带浏览器，不要使用微信或百度浏览器）。
+   复制下面的注册链接并打开：
+
+   https://vip90123.com/signup
+
+2. 注册时填写推荐码：
+
+   Sm3xWXkUif
+
+   如果有其他推荐人的推荐码，请填写对方的推荐码；没有则填写上面的推荐码。
+
+3. 填写邮箱后，记得点击“发送”按钮。
+   如果收不到验证码，请检查邮箱是否填写正确，并查看垃圾邮件，
+   同时将验证邮件标记为“这不是垃圾邮件”。推荐使用 QQ、163 等国内邮箱。
+
+【四、充值并购买套餐】
+
+4. 注册并登录后，点击余额旁边的“充值”，按提示完成充值。
+   请根据要购买的套餐充值对应金额。
+   微信或百度浏览器可能会卡住，请使用设备自带浏览器或其他浏览器。
+
+5. 充值完成后会自动进入套餐购买页面。
+   如果没有自动进入，请在网站首页找到套餐，点击右侧“购买”按钮。
+   选择账号 → 点击“下一步” → 选择套餐时长 → 点击“下一步”。
+   请认真核对账号和套餐后再提交。提交后余额变为 0 属于正常情况。
+
+【五、下载和安装】
+
+6. 回到网站首页，点击左上角“冲浪俱乐部”。
+   在页面下方“下载专区”中，点击对应设备平台图标，打开安装设置说明。
+   请务必完整阅读设置说明，安装完成后还需要继续进行后续设置。
+
+【六、安装其他设备】
+
+7. 如需安装其他设备，登录网站首页，在“下载专区”点击对应设备图标，
+   按说明完成安装和设置，然后使用同一个账号登录。
+   不要重复注册账号或子账号，也不要重复充值、购买套餐。
+'@
+
+    $box = [System.Windows.Forms.TextBox]::new()
+    $box.Location = [System.Drawing.Point]::new(24, 62)
+    $box.Size = [System.Drawing.Size]::new(616, 476)
+    $box.Multiline = $true
+    $box.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
+    $box.ReadOnly = $true
+    $box.Text = [regex]::Replace($infoText, "\r?\n", [Environment]::NewLine)
+    $box.BackColor = [System.Drawing.Color]::FromArgb(255, 255, 249)
+    $box.ForeColor = [System.Drawing.Color]::FromArgb(48, 65, 40)
+    $box.Font = New-Font 10
+    $dialog.Controls.Add($box)
+
+    $btnCopyLink = New-Button 24 556 126 38 '复制注册链接'
+    $btnCopyLink.Add_Click({
+        Set-Clipboard -Value 'https://vip90123.com/signup'
+        [System.Windows.Forms.MessageBox]::Show($dialog, '注册链接已复制。', '已复制', 'OK', 'Information') | Out-Null
+    })
+    $dialog.Controls.Add($btnCopyLink)
+
+    $btnCopyCode = New-Button 160 556 126 38 '复制推荐码'
+    $btnCopyCode.Add_Click({
+        Set-Clipboard -Value 'Sm3xWXkUif'
+        [System.Windows.Forms.MessageBox]::Show($dialog, '推荐码已复制。', '已复制', 'OK', 'Information') | Out-Null
+    })
+    $dialog.Controls.Add($btnCopyCode)
+
+    $btnClose = New-Button 514 556 126 38 '知道了' $true
+    $btnClose.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $dialog.AcceptButton = $btnClose
+    $dialog.Controls.Add($btnClose)
+
+    [void]$dialog.ShowDialog($owner)
+}
+
+function Show-ContactDialog($owner) {
+    $dialog = [System.Windows.Forms.Form]::new()
+    $dialog.Text = '联系作者'
+    $dialog.ClientSize = [System.Drawing.Size]::new(460, 390)
+    $dialog.StartPosition = 'CenterParent'
+    $dialog.FormBorderStyle = 'FixedDialog'
+    $dialog.MaximizeBox = $false
+    $dialog.MinimizeBox = $false
+    $dialog.BackColor = [System.Drawing.Color]::FromArgb(255, 253, 242)
+    $dialog.Font = New-Font 9
+    if (Test-Path $iconPath) {
+        $dialog.Icon = [System.Drawing.Icon]::new($iconPath)
+    }
+
+    $contactInfoPage = [System.Windows.Forms.Panel]::new()
+    $contactInfoPage.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $contactInfoPage.BackColor = $dialog.BackColor
+    $dialog.Controls.Add($contactInfoPage)
+
+    $infoTitle = New-Label 24 22 412 38 '联系作者' 18 ([System.Drawing.Color]::FromArgb(48, 84, 53)) ([System.Drawing.FontStyle]::Bold)
+    $contactInfoPage.Controls.Add($infoTitle)
+    $infoHint = New-Label 24 70 412 30 '有问题、建议或需要定制，可以联系作者。' 10 ([System.Drawing.Color]::FromArgb(96, 116, 78))
+    $contactInfoPage.Controls.Add($infoHint)
+    $author = New-Label 24 120 412 28 '作者：卓哥' 11 ([System.Drawing.Color]::FromArgb(48, 84, 53)) ([System.Drawing.FontStyle]::Bold)
+    $contactInfoPage.Controls.Add($author)
+    $wechat = New-Label 24 160 412 28 '微信号：ai_creater99' 11 ([System.Drawing.Color]::FromArgb(48, 84, 53)) ([System.Drawing.FontStyle]::Bold)
+    $contactInfoPage.Controls.Add($wechat)
+    $androidHint = New-Label 24 204 412 28 '需要安卓客户端请联系作者。' 10 ([System.Drawing.Color]::FromArgb(184, 132, 48)) ([System.Drawing.FontStyle]::Bold)
+    $contactInfoPage.Controls.Add($androidHint)
+
+    $btnCopy = New-Button 24 314 120 42 '复制微信号' $true
+    $btnCopy.Add_Click({
+        Set-Clipboard -Value 'ai_creater99'
+        [System.Windows.Forms.MessageBox]::Show($dialog, '微信号已复制。', '已复制', 'OK', 'Information') | Out-Null
+    })
+    $contactInfoPage.Controls.Add($btnCopy)
+
+    $btnShowQr = New-Button 154 314 164 42 '查看微信二维码'
+    $contactInfoPage.Controls.Add($btnShowQr)
+
+    $btnInfoClose = New-Button 328 314 108 42 '关闭'
+    $btnInfoClose.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $dialog.CancelButton = $btnInfoClose
+    $contactInfoPage.Controls.Add($btnInfoClose)
+
+    $contactQrPage = [System.Windows.Forms.Panel]::new()
+    $contactQrPage.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $contactQrPage.BackColor = $dialog.BackColor
+    $dialog.Controls.Add($contactQrPage)
+
+    $qrTitle = New-Label 24 16 412 36 '微信二维码' 17 ([System.Drawing.Color]::FromArgb(48, 84, 53)) ([System.Drawing.FontStyle]::Bold)
+    $qrTitle.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    $contactQrPage.Controls.Add($qrTitle)
+    $qrHint = New-Label 24 52 412 24 '微信扫码添加作者' 10 ([System.Drawing.Color]::FromArgb(96, 116, 78))
+    $qrHint.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    $contactQrPage.Controls.Add($qrHint)
+
+    $qrBox = [System.Windows.Forms.PictureBox]::new()
+    $qrBox.Location = [System.Drawing.Point]::new(115, 78)
+    $qrBox.Size = [System.Drawing.Size]::new(230, 230)
+    $qrBox.BackColor = [System.Drawing.Color]::White
+    $qrBox.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $qrBox.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::Zoom
+    $contactQrPage.Controls.Add($qrBox)
+
+    $qrImage = $null
+    try {
+        if (!(Test-Path -LiteralPath $contactQrPath)) {
+            throw 'Contact QR code is missing.'
+        }
+        $qrImage = [System.Drawing.Image]::FromFile($contactQrPath)
+        $qrBox.Image = $qrImage
+    } catch {
+        $qrBox.Visible = $false
+        $errorLabel = New-Label 24 174 412 30 '二维码加载失败' 11 ([System.Drawing.Color]::FromArgb(174, 70, 55)) ([System.Drawing.FontStyle]::Bold)
+        $errorLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+        $contactQrPage.Controls.Add($errorLabel)
+    }
+
+    $btnBack = New-Button 115 326 108 42 '返回'
+    $contactQrPage.Controls.Add($btnBack)
+    $btnQrClose = New-Button 237 326 108 42 '关闭'
+    $btnQrClose.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $contactQrPage.Controls.Add($btnQrClose)
+
+    $btnShowQr.Add_Click({
+        $contactInfoPage.Visible = $false
+        $contactQrPage.Visible = $true
+    })
+    $btnBack.Add_Click({
+        $contactInfoPage.Visible = $true
+        $contactQrPage.Visible = $false
+    })
+    $contactInfoPage.Visible = $true
+    $contactQrPage.Visible = $false
+
+    [void]$dialog.ShowDialog($owner)
+    if ($null -ne $qrImage) {
+        $qrBox.Image = $null
+        $qrImage.Dispose()
+    }
+}
+
+function Write-Command($action, $enabled = $null, $value = $null) {
     $payload = [ordered]@{
         action = $action
         created_at = [DateTime]::UtcNow.ToString('o')
@@ -178,12 +449,100 @@ function Write-Command($action, $enabled = $null) {
     if ($null -ne $enabled) {
         $payload.enabled = [bool]$enabled
     }
+    if ($null -ne $value -and [string]::IsNullOrWhiteSpace([string]$value) -eq $false) {
+        $payload.value = [string]$value
+    }
     $name = ('{0}-{1}.json' -f [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(), [Guid]::NewGuid().ToString('N'))
     $path = Join-Path $commandDir $name
     $json = $payload | ConvertTo-Json -Compress
     $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
     [System.IO.File]::WriteAllText($path, $json, $utf8NoBom)
     $script:commandHint.Text = '已发送：' + $action
+}
+
+function Show-WhitelistDialog($owner, $state) {
+    $dialog = [System.Windows.Forms.Form]::new()
+    $dialog.Text = '管理国外白名单（这些目标走 VPN）'
+    $dialog.ClientSize = [System.Drawing.Size]::new(620, 430)
+    $dialog.StartPosition = 'CenterParent'
+    $dialog.FormBorderStyle = 'FixedDialog'
+    $dialog.MaximizeBox = $false
+    $dialog.MinimizeBox = $false
+    $dialog.BackColor = [System.Drawing.Color]::FromArgb(255, 253, 242)
+    if (Test-Path $iconPath) { $dialog.Icon = [System.Drawing.Icon]::new($iconPath) }
+    $dialog.Controls.Add((New-Label 20 16 570 28 '国外白名单（域名、IP/CIDR）' 14 ([System.Drawing.Color]::FromArgb(42,76,48)) ([System.Drawing.FontStyle]::Bold)))
+    $dialog.Controls.Add((New-Label 20 48 570 24 '列表中的目标通过 VPN；国内应用仍按当前分流模式直连。' 9 ([System.Drawing.Color]::FromArgb(96,116,78))))
+    $list = [System.Windows.Forms.ListBox]::new()
+    $list.Location = [System.Drawing.Point]::new(20, 82)
+    $list.Size = [System.Drawing.Size]::new(580, 230)
+    $list.Font = New-Font 10
+    foreach ($v in @($state.foreign_domains)) { if (-not [string]::IsNullOrWhiteSpace([string]$v)) { [void]$list.Items.Add(('域名 | ' + $v)) } }
+    foreach ($v in @($state.foreign_cidrs)) { if (-not [string]::IsNullOrWhiteSpace([string]$v)) { [void]$list.Items.Add(('IP/CIDR | ' + $v)) } }
+    $dialog.Controls.Add($list)
+    $input = [System.Windows.Forms.TextBox]::new()
+    $input.Location = [System.Drawing.Point]::new(20, 328)
+    $input.Size = [System.Drawing.Size]::new(286, 30)
+    $input.Font = New-Font 10
+    $dialog.Controls.Add($input)
+    [void][DashboardForeNative]::SendMessage($input.Handle, 0x1501, [IntPtr]::Zero, '输入域名或 IP/CIDR')
+    $addDomain = New-Button 316 326 90 34 '添加域名'
+    $addIP = New-Button 414 326 90 34 '添加 IP'
+    $remove = New-Button 510 326 90 34 '删除选中'
+    @($addDomain,$addIP,$remove) | ForEach-Object { $dialog.Controls.Add($_) }
+    $addDomain.Add_Click({
+        $v = $input.Text.Trim(); if ($v -eq '') { return }
+        Write-Command 'add_foreign_domain' $null $v
+        [void]$list.Items.Add(('域名 | ' + $v)); $input.Clear()
+    })
+    $addIP.Add_Click({
+        $v = $input.Text.Trim(); if ($v -eq '') { return }
+        Write-Command 'add_foreign_cidr' $null $v
+        [void]$list.Items.Add(('IP/CIDR | ' + $v)); $input.Clear()
+    })
+    $remove.Add_Click({
+        if ($list.SelectedIndex -lt 0) { return }
+        $entry = [string]$list.SelectedItem
+        if ($entry.StartsWith('域名 | ')) { Write-Command 'remove_foreign_domain' $null $entry.Substring(5) }
+        elseif ($entry.StartsWith('IP/CIDR | ')) { Write-Command 'remove_foreign_cidr' $null $entry.Substring(10) }
+        $list.Items.RemoveAt($list.SelectedIndex)
+    })
+    $close = New-Button 480 378 120 36 '完成' $true
+    $close.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $dialog.Controls.Add($close)
+    [void]$dialog.ShowDialog($owner)
+}
+
+function Show-RecommendationDialog($owner, $state) {
+    $dialog = [System.Windows.Forms.Form]::new()
+    $dialog.Text = '智能选线结果'
+    $dialog.ClientSize = [System.Drawing.Size]::new(520, 330)
+    $dialog.StartPosition = 'CenterParent'
+    $dialog.FormBorderStyle = 'FixedDialog'
+    $dialog.ControlBox = $false
+    $dialog.KeyPreview = $true
+    $dialog.BackColor = [System.Drawing.Color]::FromArgb(255,253,242)
+    $dialog.Controls.Add((New-Label 24 20 470 34 ('推荐：' + [string]$state.smart_candidate) 16 ([System.Drawing.Color]::FromArgb(42,76,48)) ([System.Drawing.FontStyle]::Bold)))
+    $nl = [Environment]::NewLine
+    $details = "ChatGPT/OpenAI：$($state.smart_successes)/$($state.smart_attempts)" + $nl + "中位耗时：$($state.smart_median_ms) ms　最慢：$($state.smart_slowest_ms) ms" + $nl + "出口：$($state.smart_exit_ip) / $($state.smart_exit_region)"
+    $dialog.Controls.Add((New-Label 24 76 470 110 $details 10 ([System.Drawing.Color]::FromArgb(42,76,48))))
+    $count = 20
+    $countLabel = New-Label 24 198 470 28 '20 秒后自动采用推荐线路' 10 ([System.Drawing.Color]::FromArgb(184,132,48)) ([System.Drawing.FontStyle]::Bold)
+    $dialog.Controls.Add($countLabel)
+    $accept = New-Button 24 248 220 42 '立即采用' $true
+    $restore = New-Button 268 248 220 42 '恢复原线路'
+    $dialog.Controls.Add($accept); $dialog.Controls.Add($restore)
+    $decision = $false
+    $accept.Add_Click({ $script:recommendDecision = 'accept'; Write-Command 'smart_select_accept'; $dialog.Close() })
+    $restore.Add_Click({ $script:recommendDecision = 'restore'; Write-Command 'smart_select_restore'; $dialog.Close() })
+    $dialog.Add_KeyDown({ param($sender,$e) if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { $e.SuppressKeyPress = $true } })
+    $tick = [System.Windows.Forms.Timer]::new(); $tick.Interval = 1000
+    $tick.Add_Tick({
+        $count--; $countLabel.Text = "$count 秒后自动采用推荐线路"
+        if ($count -le 0) { $tick.Stop(); Write-Command 'smart_select_accept'; $dialog.Close() }
+    })
+    $dialog.Add_Shown({ $tick.Start() })
+    $dialog.Add_FormClosed({ $tick.Stop(); $tick.Dispose() })
+    [void]$dialog.ShowDialog($owner)
 }
 
 function Format-Time($value) {
@@ -199,21 +558,21 @@ function Format-Time($value) {
     }
 }
 
-$ink = [System.Drawing.Color]::FromArgb(24, 44, 56)
-$muted = [System.Drawing.Color]::FromArgb(96, 116, 128)
-$line = [System.Drawing.Color]::FromArgb(211, 225, 232)
-$cyan = [System.Drawing.Color]::FromArgb(25, 137, 166)
-$green = [System.Drawing.Color]::FromArgb(25, 154, 116)
-$amber = [System.Drawing.Color]::FromArgb(196, 132, 28)
-$paper = [System.Drawing.Color]::FromArgb(248, 252, 253)
-$glass = [System.Drawing.Color]::FromArgb(239, 247, 250)
+$ink = [System.Drawing.Color]::FromArgb(42, 76, 48)
+$muted = [System.Drawing.Color]::FromArgb(96, 116, 78)
+$line = [System.Drawing.Color]::FromArgb(211, 226, 190)
+$cyan = [System.Drawing.Color]::FromArgb(78, 145, 124)
+$green = [System.Drawing.Color]::FromArgb(79, 158, 94)
+$amber = [System.Drawing.Color]::FromArgb(184, 132, 48)
+$paper = [System.Drawing.Color]::FromArgb(255, 253, 242)
+$glass = [System.Drawing.Color]::FromArgb(241, 249, 230)
 
 $form = [System.Windows.Forms.Form]::new()
 $form.Text = '__WINDOW_TITLE__'
-$form.Size = [System.Drawing.Size]::new(880, 640)
+$form.ClientSize = [System.Drawing.Size]::new(864, 640)
 $form.StartPosition = 'CenterScreen'
-$form.MinimumSize = [System.Drawing.Size]::new(820, 600)
-$form.BackColor = [System.Drawing.Color]::FromArgb(230, 239, 244)
+$form.MinimumSize = [System.Drawing.Size]::new(820, 640)
+$form.BackColor = [System.Drawing.Color]::FromArgb(250, 244, 220)
 $form.Font = New-Font 9
 $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
 $form.ShowInTaskbar = $true
@@ -221,15 +580,22 @@ $form.TopMost = $true
 if (Test-Path $iconPath) {
     $form.Icon = [System.Drawing.Icon]::new($iconPath)
 }
+$script:hasDashboardBackground = $false
+if (Test-Path $dashboardBgPath) {
+    $form.BackgroundImage = [System.Drawing.Image]::FromFile($dashboardBgPath)
+    $form.BackgroundImageLayout = [System.Windows.Forms.ImageLayout]::Stretch
+    $script:hasDashboardBackground = $true
+}
 
 $form.Add_Paint({
     param($sender, $e)
+    if ($script:hasDashboardBackground) { return }
     $rect = $sender.ClientRectangle
     if ($rect.Width -le 0 -or $rect.Height -le 0) { return }
     $brush = [System.Drawing.Drawing2D.LinearGradientBrush]::new(
         $rect,
-        [System.Drawing.Color]::FromArgb(244, 250, 252),
-        [System.Drawing.Color]::FromArgb(218, 232, 240),
+        [System.Drawing.Color]::FromArgb(250, 244, 220),
+        [System.Drawing.Color]::FromArgb(219, 239, 211),
         35
     )
     $e.Graphics.FillRectangle($brush, $rect)
@@ -239,16 +605,33 @@ $form.Add_Paint({
 $header = New-Panel 24 22 816 118 $paper
 $form.Controls.Add($header)
 
-if (Test-Path $iconPath) {
-    $iconBox = [System.Windows.Forms.PictureBox]::new()
-    $iconBox.Location = [System.Drawing.Point]::new(24, 24)
-    $iconBox.Size = [System.Drawing.Size]::new(70, 70)
-    $iconBox.SizeMode = 'Zoom'
-    $iconBox.Image = ([System.Drawing.Icon]::new($iconPath)).ToBitmap()
-    $header.Controls.Add($iconBox)
+$headerQrHost = New-Panel 18 18 82 82 ([System.Drawing.Color]::White)
+$header.Controls.Add($headerQrHost)
+$headerQrBox = [System.Windows.Forms.PictureBox]::new()
+$headerQrBox.Location = [System.Drawing.Point]::new(6, 6)
+$headerQrBox.Size = [System.Drawing.Size]::new(70, 70)
+$headerQrBox.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::Zoom
+$headerQrBox.BackColor = [System.Drawing.Color]::White
+$headerQrHost.Controls.Add($headerQrBox)
+$headerQrImage = $null
+try {
+    if (!(Test-Path -LiteralPath $contactQrPath)) {
+        throw 'Contact QR code is missing.'
+    }
+    $headerQrImage = [System.Drawing.Image]::FromFile($contactQrPath)
+    $headerQrBox.Image = $headerQrImage
+} catch {
+    $headerQrBox.Visible = $false
+    $headerQrError = [System.Windows.Forms.Label]::new()
+    $headerQrError.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $headerQrError.Text = '二维码加载失败'
+    $headerQrError.Font = New-Font 7 ([System.Drawing.FontStyle]::Bold)
+    $headerQrError.ForeColor = [System.Drawing.Color]::FromArgb(174, 70, 55)
+    $headerQrError.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    $headerQrHost.Controls.Add($headerQrError)
 }
 
-$title = New-Label 112 24 280 34 'AnyConnect 分流管理台' 18 $ink ([System.Drawing.FontStyle]::Bold)
+$title = New-Label 112 24 380 34 'AnyConnect 分流管理台' 18 $ink ([System.Drawing.FontStyle]::Bold)
 $header.Controls.Add($title)
 $subtitle = New-Label 114 62 340 24 '控制、线路和诊断状态' 9 $muted
 $header.Controls.Add($subtitle)
@@ -274,31 +657,38 @@ $control.Controls.Add($commandHint)
 
 $btnDisconnect = New-Button 24 66 158 42 '断开 VPN'
 $btnReconnect = New-Button 202 66 158 42 '重新连接' $true
-$btnCodex = New-Button 24 124 158 42 'Codex 稳定线路'
-$btnRestore = New-Button 202 124 158 42 '恢复常用线路'
+$btnCodex = New-Button 24 124 336 42 'ChatGPT/Codex 智能选线'
+$btnRestore = New-Button 24 124 336 42 '恢复常用线路'
+$btnRestore.Visible = $false
 $btnUpdate = New-Button 24 182 158 42 '更新 IP 数据库'
 $btnLog = New-Button 202 182 158 42 '查看日志'
-$btnContact = New-Button 24 240 158 42 '联系作者'
-$btnQuit = New-Button 202 240 158 42 '退出程序'
-@($btnDisconnect,$btnReconnect,$btnCodex,$btnRestore,$btnUpdate,$btnLog,$btnContact,$btnQuit) | ForEach-Object { $control.Controls.Add($_) }
+$btnQuit = New-Button 24 240 336 42 '退出程序'
+@($btnDisconnect,$btnReconnect,$btnCodex,$btnRestore,$btnUpdate,$btnLog,$btnQuit) | ForEach-Object { $control.Controls.Add($_) }
 
-$chkSplit = [System.Windows.Forms.CheckBox]::new()
-$chkSplit.Location = [System.Drawing.Point]::new(26, 318)
-$chkSplit.Size = [System.Drawing.Size]::new(150, 26)
-$chkSplit.Text = '启用分流'
-$chkSplit.ForeColor = $ink
-$chkSplit.BackColor = $paper
-$chkSplit.Font = New-Font 10
-$control.Controls.Add($chkSplit)
+$splitAlwaysOn = New-Label 26 318 98 26 '分流已常驻' 10 $green ([System.Drawing.FontStyle]::Bold)
+$control.Controls.Add($splitAlwaysOn)
 
 $chkAuto = [System.Windows.Forms.CheckBox]::new()
-$chkAuto.Location = [System.Drawing.Point]::new(202, 318)
-$chkAuto.Size = [System.Drawing.Size]::new(150, 26)
+$chkAuto.Location = [System.Drawing.Point]::new(126, 318)
+$chkAuto.Size = [System.Drawing.Size]::new(96, 26)
 $chkAuto.Text = '开机自启'
 $chkAuto.ForeColor = $ink
 $chkAuto.BackColor = $paper
 $chkAuto.Font = New-Font 10
 $control.Controls.Add($chkAuto)
+
+$cmbSplitMode = [System.Windows.Forms.ComboBox]::new()
+$cmbSplitMode.Location = [System.Drawing.Point]::new(224, 315)
+$cmbSplitMode.Size = [System.Drawing.Size]::new(136, 30)
+$cmbSplitMode.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+$cmbSplitMode.Font = New-Font 9
+[void]$cmbSplitMode.Items.Add('国内直连优先')
+[void]$cmbSplitMode.Items.Add('国外 VPN 优先')
+$cmbSplitMode.SelectedIndex = 0
+$control.Controls.Add($cmbSplitMode)
+
+$btnWhitelist = New-Button 24 354 336 38 '管理国外白名单（这些目标走 VPN）'
+$control.Controls.Add($btnWhitelist)
 
 $diagnostics = New-Panel 440 158 400 408 $paper
 $form.Controls.Add($diagnostics)
@@ -320,7 +710,23 @@ foreach ($name in $diagNames) {
     $y += 42
 }
 
+$footerActions = [System.Windows.Forms.Panel]::new()
+$footerActions.Location = [System.Drawing.Point]::new(588, 584)
+$footerActions.Size = [System.Drawing.Size]::new(252, 38)
+$footerActions.BackColor = [System.Drawing.Color]::Transparent
+$footerActions.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+$form.Controls.Add($footerActions)
+
+$btnRechargeHelp = New-Button 0 0 126 38 '充值说明'
+$btnRechargeHelp.Add_Click({ Show-RechargeDialog $form })
+$footerActions.Controls.Add($btnRechargeHelp)
+$btnContact = New-Button 136 0 116 38 '联系作者'
+$btnContact.Add_Click({ Show-ContactDialog $form })
+$footerActions.Controls.Add($btnContact)
+
 $script:hydrating = $false
+$script:lastSmartResult = ''
+$script:latestState = $null
 
 function Refresh-State {
     if (!(Test-Path $snapshotPath)) { return }
@@ -333,17 +739,42 @@ function Refresh-State {
     }
 
     $script:hydrating = $true
+    $script:latestState = $state
     $status = [string]$state.status_text
     if ([string]::IsNullOrWhiteSpace($status)) { $status = '状态：未知' }
     $statusLabel.Text = $status
     $site = [string]$state.current_site
     if ([string]::IsNullOrWhiteSpace($site)) { $site = '未连接' }
     $siteLabel.Text = '当前站点：' + $site
-    $split = [bool]$state.split_tunnel_enabled
     $auto = [bool]$state.auto_start_enabled
-    $chkSplit.Checked = $split
+    $codexMode = $false
+    if ($null -ne $state.codex_mode_active) { $codexMode = [bool]$state.codex_mode_active }
+    $btnCodex.Visible = -not $codexMode
+    $btnRestore.Visible = $codexMode
+    $smartState = [string]$state.smart_state
+    $smartRunning = @('running','restoring','current_healthy','recommendation') -contains $smartState
+    $btnDisconnect.Enabled = -not $smartRunning
+    $btnReconnect.Enabled = -not $smartRunning
+    $btnRestore.Enabled = -not $smartRunning
+    $btnUpdate.Enabled = -not $smartRunning
+    $btnWhitelist.Enabled = -not $smartRunning
+    $cmbSplitMode.Enabled = -not $smartRunning
+    if ($smartState -eq 'running' -or $smartState -eq 'restoring') { $btnCodex.Visible = $true; $btnRestore.Visible = $false; $btnCodex.Text = '取消智能选线' }
+    else { $btnCodex.Text = 'ChatGPT/Codex 智能选线' }
+    $resultID = [string]$state.smart_result_id
+    if ($resultID -ne '' -and $resultID -ne $script:lastSmartResult) {
+        $script:lastSmartResult = $resultID
+        if ($smartState -eq 'current_healthy') {
+            $answer = [System.Windows.Forms.MessageBox]::Show($form, ([string]$state.smart_message + [Environment]::NewLine + [Environment]::NewLine + '是否继续深度检测其他线路？'), '当前线路健康', 'YesNo', 'Information')
+            if ($answer -eq [System.Windows.Forms.DialogResult]::Yes) { Write-Command 'smart_select_continue' } else { Write-Command 'smart_select_cancel' }
+        } elseif ($smartState -eq 'recommendation') { Show-RecommendationDialog $form $state }
+    }
     $chkAuto.Checked = $auto
-    $diagLabels['分流模式'].Text = $(if ($split) { '已启用' } else { '未启用' })
+    $splitMode = [string]$state.split_mode
+    $modeIndex = $(if ($splitMode -eq 'foreign_direct') { 1 } else { 0 })
+    if ($cmbSplitMode.SelectedIndex -ne $modeIndex) { $cmbSplitMode.SelectedIndex = $modeIndex }
+    $modeText = $(if ($modeIndex -eq 1) { '国外 VPN 优先' } else { '国内直连优先' })
+    $diagLabels['分流模式'].Text = '已启用 / ' + $modeText
     $backend = [string]$state.backend
     if ([string]::IsNullOrWhiteSpace($backend)) { $backend = '未连接' }
     $diagLabels['后端模式'].Text = $backend
@@ -365,24 +796,30 @@ function Refresh-State {
         $statusDot.BackColor = [System.Drawing.Color]::FromArgb(210, 76, 76)
     } elseif ($status -like '*正在*' -or $status -like '*初始化*') {
         $statusDot.BackColor = $amber
-    } elseif ($split) {
-        $statusDot.BackColor = $green
     } else {
-        $statusDot.BackColor = $cyan
+        $statusDot.BackColor = $green
     }
     $script:hydrating = $false
 }
 
 $btnDisconnect.Add_Click({ Write-Command 'disconnect' })
 $btnReconnect.Add_Click({ Write-Command 'reconnect' })
-$btnCodex.Add_Click({ Write-Command 'codex_mode' })
+$btnCodex.Add_Click({
+    if ($null -ne $script:latestState -and @('running','restoring') -contains [string]$script:latestState.smart_state) { Write-Command 'smart_select_cancel'; return }
+    $answer = [System.Windows.Forms.MessageBox]::Show($form, '智能诊断最多 60 秒。检测期间国外连接和 ChatGPT 响应可能短暂中断，国内直连应用通常不受影响。是否开始？', '开始智能选线', 'YesNo', 'Warning')
+    if ($answer -eq [System.Windows.Forms.DialogResult]::Yes) { Write-Command 'codex_mode' }
+})
 $btnRestore.Add_Click({ Write-Command 'restore_normal' })
 $btnUpdate.Add_Click({ Write-Command 'update_ipdb' })
 $btnLog.Add_Click({ Write-Command 'view_log' })
-$btnContact.Add_Click({ Write-Command 'contact_author' })
+$btnWhitelist.Add_Click({ if ($null -ne $script:latestState) { Show-WhitelistDialog $form $script:latestState } })
 $btnQuit.Add_Click({ Write-Command 'quit' })
-$chkSplit.Add_CheckedChanged({ if (-not $script:hydrating) { Write-Command 'toggle_split' $chkSplit.Checked } })
 $chkAuto.Add_CheckedChanged({ if (-not $script:hydrating) { Write-Command 'toggle_autostart' $chkAuto.Checked } })
+$cmbSplitMode.Add_SelectedIndexChanged({
+    if ($script:hydrating -or $cmbSplitMode.SelectedIndex -lt 0) { return }
+    $mode = $(if ($cmbSplitMode.SelectedIndex -eq 1) { 'foreign_direct' } else { 'domestic_direct' })
+    Write-Command 'set_split_mode' $null $mode
+})
 
 $timer = [System.Windows.Forms.Timer]::new()
 $timer.Interval = 1000
@@ -408,6 +845,10 @@ $form.Add_Shown({
 $form.Add_FormClosed({
     $timer.Stop()
     $unTopTimer.Stop()
+    if ($null -ne $headerQrImage) {
+        $headerQrBox.Image = $null
+        $headerQrImage.Dispose()
+    }
 })
 
 [void]$form.ShowDialog()

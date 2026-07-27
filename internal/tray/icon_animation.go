@@ -24,9 +24,9 @@ type trayIconAnimation struct {
 func trayIconAnimationFor(mode trayIconMode) trayIconAnimation {
 	switch mode {
 	case trayIconModeActive:
-		return trayIconAnimation{frames: iconActiveFrames, interval: 850 * time.Millisecond}
+		return trayIconAnimation{frames: [][]byte{iconActive}}
 	case trayIconModeBusy:
-		return trayIconAnimation{frames: iconBusyFrames, interval: 140 * time.Millisecond}
+		return trayIconAnimation{frames: [][]byte{iconBusy}}
 	case trayIconModeError:
 		return trayIconAnimation{frames: [][]byte{iconError}}
 	case trayIconModeIdle:

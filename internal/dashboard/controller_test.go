@@ -7,22 +7,15 @@ import (
 func TestControllerDispatchesPendingCommands(t *testing.T) {
 	store := NewStore(t.TempDir())
 	var disconnected, reconnected, viewedLog bool
-	var splitValue *bool
 
 	controller := NewController(store, Actions{
 		OnDisconnect: func() { disconnected = true },
 		OnReconnect:  func() { reconnected = true },
-		OnToggleSplit: func(enabled bool) {
-			splitValue = &enabled
-		},
-		OnViewLog: func() { viewedLog = true },
+		OnViewLog:    func() { viewedLog = true },
 	})
 
 	if err := store.WriteCommand(Command{Action: ActionDisconnect}); err != nil {
 		t.Fatalf("write disconnect command: %v", err)
-	}
-	if err := store.WriteCommand(Command{Action: ActionToggleSplit, Enabled: boolPtr(true)}); err != nil {
-		t.Fatalf("write toggle command: %v", err)
 	}
 	if err := store.WriteCommand(Command{Action: ActionViewLog}); err != nil {
 		t.Fatalf("write view log command: %v", err)
@@ -33,9 +26,6 @@ func TestControllerDispatchesPendingCommands(t *testing.T) {
 	}
 	if !disconnected || reconnected || !viewedLog {
 		t.Fatalf("unexpected simple actions: disconnected=%v reconnected=%v viewedLog=%v", disconnected, reconnected, viewedLog)
-	}
-	if splitValue == nil || !*splitValue {
-		t.Fatalf("toggle split was not dispatched with true: %#v", splitValue)
 	}
 }
 
@@ -58,3 +48,54 @@ func TestControllerUpdateSnapshotWritesLatestState(t *testing.T) {
 		t.Fatal("UpdateSnapshot() did not stamp UpdatedAt")
 	}
 }
+
+func TestControllerDispatchesForeignWhitelistCommands(t *testing.T) {
+	store := NewStore(t.TempDir())
+	var gotDomain, gotCIDR string
+
+	controller := NewController(store, Actions{
+		OnAddForeignDomain: func(v string) { gotDomain = v },
+		OnAddForeignCIDR:   func(v string) { gotCIDR = v },
+	})
+
+	if err := store.WriteCommand(Command{Action: ActionAddForeignDomain, Value: strPtr("openai.com")}); err != nil {
+		t.Fatalf("write add_foreign_domain command: %v", err)
+	}
+	if err := store.WriteCommand(Command{Action: ActionAddForeignCIDR, Value: strPtr("1.2.3.0/24")}); err != nil {
+		t.Fatalf("write add_foreign_cidr command: %v", err)
+	}
+	// Empty value must be rejected by Validate.
+	if err := store.WriteCommand(Command{Action: ActionAddForeignDomain, Value: strPtr("")}); err == nil {
+		t.Fatal("expected validation error for empty foreign domain value")
+	}
+
+	if err := controller.ProcessPendingCommands(); err != nil {
+		t.Fatalf("ProcessPendingCommands() error = %v", err)
+	}
+	if gotDomain != "openai.com" {
+		t.Fatalf("foreign domain dispatched = %q, want openai.com", gotDomain)
+	}
+	if gotCIDR != "1.2.3.0/24" {
+		t.Fatalf("foreign cidr dispatched = %q, want 1.2.3.0/24", gotCIDR)
+	}
+}
+
+func TestControllerDispatchesSplitModeCommand(t *testing.T) {
+	store := NewStore(t.TempDir())
+	gotMode := ""
+	controller := NewController(store, Actions{
+		OnSetSplitMode: func(mode string) { gotMode = mode },
+	})
+
+	if err := store.WriteCommand(Command{Action: ActionSetSplitMode, Value: strPtr("foreign_direct")}); err != nil {
+		t.Fatalf("write set_split_mode command: %v", err)
+	}
+	if err := controller.ProcessPendingCommands(); err != nil {
+		t.Fatalf("ProcessPendingCommands() error = %v", err)
+	}
+	if gotMode != "foreign_direct" {
+		t.Fatalf("split mode dispatched = %q, want foreign_direct", gotMode)
+	}
+}
+
+func strPtr(s string) *string { return &s }

@@ -1,3 +1,15 @@
 NUL
 bin/
 *.exe
+
+# Local agent/session state may contain ephemeral access tokens.
+.superpowers/
+
+# Reverse-engineering scratch data and generated verification output.
+.tmp-openconnect/
+artifacts/android-auto-runs/
+artifacts/backups/
+artifacts/*.json
+artifacts/*.log
+artifacts/*.xml
+dist/backups/

@@ -1,7 +1,6 @@
 package tray
 
 import (
-	"bytes"
 	"encoding/binary"
 	"testing"
 )
@@ -27,33 +26,25 @@ func TestGeneratedTrayIconsUseMultipleSizes(t *testing.T) {
 	}
 }
 
-func TestTrayIconAnimationsExposeExpectedFrames(t *testing.T) {
+func TestTrayIconModesUseStaticFrames(t *testing.T) {
 	tests := []struct {
-		name      string
-		mode      trayIconMode
-		minFrames int
-		animated  bool
+		name string
+		mode trayIconMode
 	}{
-		{name: "idle", mode: trayIconModeIdle, minFrames: 1, animated: false},
-		{name: "active", mode: trayIconModeActive, minFrames: 4, animated: true},
-		{name: "busy", mode: trayIconModeBusy, minFrames: 4, animated: true},
-		{name: "error", mode: trayIconModeError, minFrames: 1, animated: false},
+		{name: "idle", mode: trayIconModeIdle},
+		{name: "active", mode: trayIconModeActive},
+		{name: "busy", mode: trayIconModeBusy},
+		{name: "error", mode: trayIconModeError},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			animation := trayIconAnimationFor(tt.mode)
-			if len(animation.frames) < tt.minFrames {
-				t.Fatalf("%s animation has %d frame(s), want at least %d", tt.name, len(animation.frames), tt.minFrames)
+			if len(animation.frames) != 1 {
+				t.Fatalf("%s icon mode has %d frame(s), want exactly 1", tt.name, len(animation.frames))
 			}
-			if tt.animated && animation.interval <= 0 {
-				t.Fatalf("%s animation interval = %s, want a positive duration", tt.name, animation.interval)
-			}
-			if !tt.animated && animation.interval != 0 {
+			if animation.interval != 0 {
 				t.Fatalf("%s static icon interval = %s, want 0", tt.name, animation.interval)
-			}
-			if tt.animated && !containsDistinctFrames(animation.frames) {
-				t.Fatalf("%s animation frames are identical", tt.name)
 			}
 		})
 	}
@@ -68,16 +59,4 @@ func icoImageCount(t *testing.T, icon []byte) int {
 		t.Fatalf("invalid ICO header")
 	}
 	return int(binary.LittleEndian.Uint16(icon[4:6]))
-}
-
-func containsDistinctFrames(frames [][]byte) bool {
-	if len(frames) < 2 {
-		return false
-	}
-	for _, frame := range frames[1:] {
-		if !bytes.Equal(frames[0], frame) {
-			return true
-		}
-	}
-	return false
 }

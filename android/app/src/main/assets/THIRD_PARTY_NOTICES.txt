@@ -1,0 +1,14 @@
+This APK includes libopenconnect.so and libstoken.so native binaries extracted
+from the F-Droid OpenConnect for Android 1.12 package
+net.openconnect_vpn.android_1120.apk for immediate device validation.
+
+OpenConnect core and its JNI binding are from the OpenConnect project:
+https://www.infradead.org/openconnect/
+https://gitlab.com/openconnect/openconnect
+
+The F-Droid package page identifies OpenConnect for Android as GPLv2-or-later:
+https://f-droid.org/en/packages/net.openconnect_vpn.android/
+
+This project uses the native OpenConnect-compatible binaries as an interim
+Gate 1 validation artifact. The app UI and VpnService code in this repository
+do not copy ics-openconnect UI or Service implementation.

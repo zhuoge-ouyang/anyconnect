@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,7 +21,6 @@ import (
 	"golang.org/x/sys/windows"
 
 	"github.com/user/anyconnect-split/internal/autostart"
-	"github.com/user/anyconnect-split/internal/codexprobe"
 	"github.com/user/anyconnect-split/internal/config"
 	"github.com/user/anyconnect-split/internal/credential"
 	"github.com/user/anyconnect-split/internal/dashboard"
@@ -28,6 +28,7 @@ import (
 	"github.com/user/anyconnect-split/internal/ipdb"
 	"github.com/user/anyconnect-split/internal/monitor"
 	"github.com/user/anyconnect-split/internal/route"
+	"github.com/user/anyconnect-split/internal/smartselect"
 	"github.com/user/anyconnect-split/internal/tray"
 	"github.com/user/anyconnect-split/internal/tun"
 	"github.com/user/anyconnect-split/internal/ui"
@@ -64,6 +65,16 @@ func waitForDesktopReady(maxWait time.Duration) bool {
 		time.Sleep(500 * time.Millisecond)
 	}
 	return false
+}
+
+// runTrayLoop pins the Win32 window and its message pump to one OS thread.
+// The tray window receives callbacks through that thread's message queue, so
+// running it in an unpinned goroutine can leave the queue without a pump after
+// the Go scheduler migrates the goroutine.
+func runTrayLoop(run func()) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	run()
 }
 
 func ensureSingleInstance() {
@@ -366,7 +377,11 @@ func waitForLocalDefaultRoute(timeout time.Duration) (monitor.DefaultRoute, erro
 
 func connectionInput(cfg *config.Config, sites []ui.Site, allowAuto bool) (ui.Site, string, string, bool) {
 	if allowAuto && cfg.AutoConnect && cfg.SavedUsername != "" {
-		site, ok := preferredSite(sites, cfg.PreferredSite)
+		preferred := cfg.PreferredSite
+		if cfg.CodexModeActive && cfg.CodexPreferredSite != "" {
+			preferred = cfg.CodexPreferredSite
+		}
+		site, ok := preferredSite(sites, preferred)
 		if ok {
 			storedUsername, password, err := credential.Read(credentialTarget)
 			if err == nil && password != "" {
@@ -470,20 +485,6 @@ func codexCandidateSites(cfg *config.Config, sites []ui.Site) []ui.Site {
 		candidates = append(candidates, site)
 	}
 	return uniqueSites(candidates)
-}
-
-func probeCodex(attempts int) []codexprobe.Result {
-	if attempts <= 0 {
-		attempts = 1
-	}
-	results := make([]codexprobe.Result, 0, attempts)
-	for i := 0; i < attempts; i++ {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		results = append(results, codexprobe.Probe(ctx))
-		cancel()
-		time.Sleep(500 * time.Millisecond)
-	}
-	return results
 }
 
 func serverHostname(server string) string {
@@ -592,7 +593,11 @@ func main() {
 		log.Printf("Warning: failed to load config, using defaults: %v", err)
 		cfg = config.DefaultConfig()
 	}
-	if actualAutoStart := autostart.IsEnabled(); cfg.AutoStart != actualAutoStart {
+	actualAutoStart, autoStartErr := autostart.Reconcile()
+	if autoStartErr != nil {
+		log.Printf("Warning: failed to refresh autostart task target: %v", autoStartErr)
+	}
+	if cfg.AutoStart != actualAutoStart {
 		cfg.AutoStart = actualAutoStart
 		cfg.Save()
 	}
@@ -621,7 +626,22 @@ func main() {
 	}
 
 	dataDir := filepath.Join(baseDir(), "data")
+	txPath := filepath.Join(dataDir, "smart-select-transaction.json")
+	if tx, txErr := smartselect.LoadTransaction(txPath); txErr == nil && tx.Pending {
+		log.Printf("Recovering incomplete smart-selection transaction: original=%s", tx.OriginalSite)
+		cfg.CodexModeActive = tx.OriginalCodexMode
+		if tx.OriginalCodexMode {
+			cfg.CodexPreferredSite = tx.OriginalSite
+		} else {
+			cfg.PreferredSite = tx.OriginalSite
+		}
+		_ = cfg.Save()
+		_ = smartselect.ClearTransaction(txPath)
+	} else if txErr != nil {
+		log.Printf("Failed to read smart-selection transaction: %v", txErr)
+	}
 	dashboardStore := dashboard.NewStore(dataDir)
+	smartUI := newSmartRuntime()
 	dashboardController := dashboard.NewController(dashboardStore, dashboard.Actions{})
 	dashboardBackend := func() string { return "" }
 	dashboardRouteCount := func() int { return 0 }
@@ -634,13 +654,15 @@ func main() {
 		if backend == "" {
 			backend = "未连接"
 		}
-		if err := dashboardController.UpdateSnapshot(dashboard.Snapshot{
+		snapshot := dashboard.Snapshot{
 			StatusText:          status.StatusText,
 			CurrentSite:         status.CurrentSite,
 			SplitTunnelEnabled:  status.SplitEnabled,
+			SplitMode:           status.SplitMode,
 			AutoStartEnabled:    status.AutoStart,
 			Backend:             backend,
 			RouteCount:          routeCount,
+			CodexModeActive:     status.CodexModeActive,
 			LastIPDBUpdate:      cfg.LastUpdate,
 			OriginalGateway:     cfg.OriginalGateway,
 			OriginalInterface:   cfg.OriginalInterfaceIndex,
@@ -648,7 +670,15 @@ func main() {
 			OriginalIPv6IfIndex: cfg.OriginalIPv6Interface,
 			IPv6SplitEnabled:    cfg.IPv6SplitEnabled,
 			LastError:           status.LastError,
-		}); err != nil {
+			ForeignDomains:      append([]string(nil), cfg.ForeignDomains...),
+			ForeignCIDRs:        append([]string(nil), cfg.ForeignCIDRs...),
+		}
+		smart := smartUI.snapshot()
+		snapshot.SmartState, snapshot.SmartMessage, snapshot.SmartResultID = smart.SmartState, smart.SmartMessage, smart.SmartResultID
+		snapshot.SmartCandidate, snapshot.SmartAttempts, snapshot.SmartSuccesses = smart.SmartCandidate, smart.SmartAttempts, smart.SmartSuccesses
+		snapshot.SmartMedianMS, snapshot.SmartSlowestMS = smart.SmartMedianMS, smart.SmartSlowestMS
+		snapshot.SmartExitIP, snapshot.SmartExitRegion, snapshot.SmartDeadline = smart.SmartExitIP, smart.SmartExitRegion, smart.SmartDeadline
+		if err := dashboardController.UpdateSnapshot(snapshot); err != nil {
 			log.Printf("Failed to write dashboard snapshot: %v", err)
 		}
 	}
@@ -667,11 +697,13 @@ func main() {
 		OnViewLog: func() {
 			exec.Command("notepad", logFile).Start()
 		},
-	}, cfg.SplitTunnelEnabled, cfg.AutoStart)
+	}, cfg.AutoStart)
+	trayUI.SetCodexModeActive(cfg.CodexModeActive)
+	trayUI.SetSplitMode(cfg.SplitMode)
 	trayUI.SetStatusListener(publishDashboard)
 	trayUI.SetInitialTooltip("AnyConnect Split Tunnel - 初始化中...")
 	go func() {
-		trayUI.Run()
+		runTrayLoop(trayUI.Run)
 		os.Exit(0)
 	}()
 	trayUI.WaitReady()
@@ -810,9 +842,40 @@ func main() {
 		DataDir:             dataDir,
 		LocalGateway:        cfg.OriginalGateway,
 		LocalInterfaceIndex: cfg.OriginalInterfaceIndex,
-		DirectDomains:       append([]string{"cn"}, cfg.DomesticDomains...),
+		DirectDomains:       append([]string(nil), cfg.DomesticDomains...),
+		ForeignDomains:      cfg.ForeignDomains,
+		ForeignCIDRs:        cfg.ForeignCIDRs,
+		SplitMode:           cfg.SplitMode,
 		SingBoxLogLevel:     cfg.LogLevel,
 	})
+	// Route state is refreshed before every connection. Windows can assign a
+	// different interface index after a reboot or adapter reconnect.
+	var routeMgr *route.Manager
+	refreshLocalRoute := func() error {
+		r, err := waitForLocalDefaultRoute(5 * time.Second)
+		if err != nil {
+			return err
+		}
+		cfg.OriginalGateway = r.Gateway
+		cfg.OriginalInterfaceIndex = r.InterfaceIndex
+		cfg.OriginalIPv6Gateway = ""
+		cfg.OriginalIPv6Interface = 0
+		if r6, err := monitor.GetDefaultIPv6Route(); err == nil {
+			cfg.OriginalIPv6Gateway = r6.Gateway
+			cfg.OriginalIPv6Interface = r6.InterfaceIndex
+		} else {
+			log.Printf("IPv6 local default route unavailable during reconnect; continuing with IPv4 route: %v", err)
+		}
+		if routeMgr != nil {
+			routeMgr.SetLocalRoute(cfg.OriginalGateway, cfg.OriginalInterfaceIndex, cfg.OriginalIPv6Gateway, cfg.OriginalIPv6Interface)
+		}
+		log.Printf("Refreshed local default route before connection: gateway=%s interface_index=%d ipv6_gateway=%s ipv6_interface_index=%d",
+			cfg.OriginalGateway, cfg.OriginalInterfaceIndex, cfg.OriginalIPv6Gateway, cfg.OriginalIPv6Interface)
+		if err := cfg.Save(); err != nil {
+			log.Printf("Warning: failed to persist refreshed local route: %v", err)
+		}
+		return nil
+	}
 	var sessionMu sync.Mutex
 	activeBackend := ""
 	setActiveBackend := func(backend string) {
@@ -849,14 +912,11 @@ func main() {
 		return route.SummarizeCIDRs(cidrs)
 	}
 	loadSplitCIDRsForSite := func(site ui.Site, showProgress bool, includeDomainExceptions bool) ([]string, error) {
-		cidrs, err := db.Load()
-		if err != nil {
-			return nil, err
+		if cfg.IsDomesticDirect() {
+			return nil, nil
 		}
-		cidrs = route.SummarizeCIDRs(cidrs)
-		if len(cidrs) == 0 {
-			return cidrs, nil
-		}
+
+		cidrs := append([]string(nil), cfg.DomesticCIDRs...)
 
 		if !cfg.IPv6SplitEnabled {
 			before := len(cidrs)
@@ -886,7 +946,7 @@ func main() {
 				cidrs = append(cidrs, domainCIDRs...)
 			}
 		}
-		return route.SummarizeCIDRs(cidrs), nil
+		return summarizeAndValidateRoutePlan("domestic whitelist", cidrs, cfg.RouteEntryLimit)
 	}
 	tunDirectCIDRsForSite := func(site ui.Site, showProgress bool) ([]string, []string, error) {
 		protected := protectedServerCIDRs(site)
@@ -899,12 +959,15 @@ func main() {
 		}
 		return cidrs, protected, nil
 	}
-	connectWithBestBackend := func(site ui.Site, username, password string) (string, error) {
+	connectWithBestBackendContext := func(ctx context.Context, site ui.Site, username, password string) (string, error) {
+		if err := refreshLocalRoute(); err != nil {
+			return "", fmt.Errorf("刷新本地默认路由失败: %w", err)
+		}
 		if cfg.TrafficBackend != config.TrafficBackendCiscoStatic {
 			directCIDRs, protectedCIDRs, err := tunDirectCIDRsForSite(site, false)
 			if err != nil {
 				log.Printf("OpenConnect TUN skipped, could not load split rules: %v", err)
-			} else if err := tunSession.Start(context.Background(), tun.StartOptions{
+			} else if err := tunSession.Start(ctx, tun.StartOptions{
 				Server:         site.Server,
 				Username:       username,
 				Password:       password,
@@ -916,6 +979,9 @@ func main() {
 				return config.TrafficBackendOpenTun, nil
 			} else {
 				_ = tunSession.Stop()
+				if ctx.Err() != nil {
+					return "", ctx.Err()
+				}
 				if !shouldFallbackFromOpenConnect(err, cfg.TrafficBackend) {
 					log.Printf("OpenConnect TUN failed without fallback: %v", err)
 					return "", err
@@ -927,22 +993,29 @@ func main() {
 		if cliPath == "" {
 			return "", fmt.Errorf("vpncli.exe not found and OpenConnect TUN is unavailable")
 		}
-		vpn.PrepareForNewConnection(cliPath)
-		if err := vpn.Connect(cliPath, site.Server, username, password); err != nil {
+		vpn.PrepareForNewConnectionContext(ctx, cliPath)
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		if err := vpn.ConnectContext(ctx, cliPath, site.Server, username, password); err != nil {
 			return "", err
 		}
 		setActiveBackend(config.TrafficBackendCiscoStatic)
 		return config.TrafficBackendCiscoStatic, nil
 	}
+	connectWithBestBackend := func(site ui.Site, username, password string) (string, error) {
+		return connectWithBestBackendContext(context.Background(), site, username, password)
+	}
 	allowAutoConnect := true
 	var connectedSite ui.Site
+	var connectedUsername, connectedPassword string
 	for {
 		selectedSite, username, password, ok := connectionInput(cfg, sites, allowAutoConnect)
 		if !ok {
 			log.Println("User cancelled login dialog")
 			os.Exit(0)
 		}
-		log.Printf("User selected site: %s (%s), username: %s", selectedSite.Name, selectedSite.Server, username)
+		log.Printf("User selected site: %s (%s)", selectedSite.Name, selectedSite.Server)
 		cacheServerIPs(selectedSite)
 
 		// 9. 连接 VPN
@@ -956,12 +1029,14 @@ func main() {
 		}
 		log.Printf("VPN connected with backend: %s", backend)
 		connectedSite = selectedSite
+		connectedUsername = username
+		connectedPassword = password
 		break
 	}
 	log.Println("VPN connected successfully")
 
 	// Initialize route manager
-	routeMgr := route.NewManager(
+	routeMgr = route.NewManager(
 		cfg.OriginalGateway,
 		cfg.OriginalInterfaceIndex,
 		cfg.OriginalIPv6Gateway,
@@ -988,6 +1063,7 @@ func main() {
 	var routeApplyMu sync.Mutex
 	var disconnectMu sync.Mutex
 	var modeSwitchMu sync.Mutex
+	var splitModeChangeMu sync.Mutex
 	var ipdbUpdateMu sync.Mutex
 	var routeOpsMu sync.Mutex
 	routeOpsCtx, cancelRouteOps := context.WithCancel(context.Background())
@@ -1029,6 +1105,104 @@ func main() {
 		if trayUI != nil && total > 0 && done > 0 {
 			trayUI.SetStatusBusy(fmt.Sprintf("正在清理路由 %d/%d...", done, total))
 		}
+	}
+
+	// applyDomesticDirectStaticRoutes implements domestic_direct mode on the
+	// Cisco static backend: 默认全部直连（0.0.0.0/1 + 128.0.0.0/1 走本地网关），
+	// 仅国外白名单域名/IP 走 VPN。
+	applyDomesticDirectStaticRoutes := func(ctx context.Context, forceRefresh bool) {
+		vpnRoute, err := monitor.GetVPNDefaultRoute()
+		if err != nil {
+			log.Printf("Domestic direct static skipped, VPN route unavailable: %v", err)
+			trayUI.SetStatusError("无法检测 VPN 网关，请稍后重试")
+			return
+		}
+		routeMgr.SetVPNRouteTarget(vpnRoute.Gateway, vpnRoute.InterfaceIndex)
+
+		if routeMgr.HasAppliedRoutes() && routeMgr.HasAppliedVPNRoutes() && !forceRefresh {
+			trayUI.SetStatusActive(routeMgr.GetAppliedRouteCount() + routeMgr.GetAppliedVPNRouteCount())
+			vpnMon.SetState(monitor.StateActive)
+			return
+		}
+
+		if forceRefresh && (routeMgr.HasAppliedRoutes() || routeMgr.HasAppliedVPNRoutes()) {
+			trayUI.SetStatusBusy("正在刷新旧路由...")
+			removed, removeErrors := routeMgr.RemoveAllRoutesContext(ctx, cleanupProgress)
+			if err := ctx.Err(); err != nil {
+				log.Printf("Domestic direct route refresh canceled during cleanup: %v", err)
+				return
+			}
+			log.Printf("Routes cleaned before refresh: %d removed, %d errors", removed, removeErrors)
+		}
+
+		// 1. 默认全部直连：覆盖整个 IPv4 空间的两条 /1 路由走本地网关。
+		bypassCIDRs := []string{"0.0.0.0/1", "128.0.0.0/1"}
+		if cfg.IPv6SplitEnabled {
+			bypassCIDRs = append(bypassCIDRs, "::/1", "8000::/1")
+		}
+		// 显式保护 VPN 服务器 IP（/32 直连，优先级高于 /1 与 VPN 白名单）。
+		protected := protectedServerCIDRs(connectedSite)
+		bypassCIDRs = append(bypassCIDRs, protected...)
+
+		trayUI.SetStatusBusy("正在写入默认直连路由...")
+		added, errors := routeMgr.AddRoutesContext(ctx, bypassCIDRs, routeProgress)
+		if err := ctx.Err(); err != nil {
+			log.Printf("Domestic direct bypass application canceled: %v", err)
+			return
+		}
+		log.Printf("Domestic direct bypass routes applied: %d added, %d errors", added, errors)
+
+		// 2. 国外白名单走 VPN。
+		foreignCIDRs := append([]string(nil), cfg.ForeignCIDRs...)
+		if len(cfg.ForeignDomains) > 0 {
+			if trayUI != nil {
+				trayUI.SetStatusBusy("正在解析国外域名白名单...")
+			}
+			resolved := domainroute.Resolve(cfg.ForeignDomains)
+			if len(resolved) > 0 {
+				log.Printf("Resolved %d foreign domain routes", len(resolved))
+				foreignCIDRs = append(foreignCIDRs, resolved...)
+			}
+		}
+		if !cfg.IPv6SplitEnabled {
+			foreignCIDRs = route.IPv4Only(foreignCIDRs)
+		}
+		var planErr error
+		foreignCIDRs, planErr = summarizeAndValidateRoutePlan("foreign whitelist", foreignCIDRs, cfg.RouteEntryLimit)
+		if planErr != nil {
+			log.Printf("Domestic direct VPN route plan rejected: %v", planErr)
+			trayUI.SetStatusError("国外白名单路由过多，请减少白名单")
+			return
+		}
+		// 排除与 VPN 服务器 IP 重叠的国外条目，避免把隧道服务器本身绕进 VPN。
+		if len(foreignCIDRs) > 0 {
+			protectedIPs := allProtectedServerIPs(connectedSite)
+			if len(protectedIPs) > 0 {
+				filtered, excluded := route.ExcludeCIDRsContainingIPs(foreignCIDRs, protectedIPs)
+				if len(excluded) > 0 {
+					log.Printf("Excluded %d foreign route(s) overlapping VPN server IP(s)", len(excluded))
+					foreignCIDRs = filtered
+				}
+			}
+		}
+
+		if len(foreignCIDRs) > 0 {
+			trayUI.SetStatusBusy(fmt.Sprintf("正在写入 %d 条国外白名单路由...", len(foreignCIDRs)))
+			vpnAdded, vpnErrors := routeMgr.AddVPNRoutesContext(ctx, foreignCIDRs, routeProgress)
+			if err := ctx.Err(); err != nil {
+				log.Printf("Domestic direct VPN route application canceled: %v", err)
+				return
+			}
+			log.Printf("Domestic direct VPN routes applied: %d added, %d errors", vpnAdded, vpnErrors)
+		}
+
+		total := routeMgr.GetAppliedRouteCount() + routeMgr.GetAppliedVPNRouteCount()
+		if currentBackend() == config.TrafficBackendCiscoStatic && cfg.TrafficBackend != config.TrafficBackendCiscoStatic {
+			trayUI.SetStatusStaticFallback(total)
+		} else {
+			trayUI.SetStatusActive(total)
+		}
+		vpnMon.SetState(monitor.StateActive)
 	}
 
 	applySplitRoutes := func(forceRefresh bool) {
@@ -1081,6 +1255,11 @@ func main() {
 			return
 		}
 
+		if cfg.IsDomesticDirect() {
+			applyDomesticDirectStaticRoutes(ctx, forceRefresh)
+			return
+		}
+
 		trayUI.SetStatusBusy("正在加载路由...")
 		cidrs, err := targetSplitCIDRs(true)
 		if err != nil {
@@ -1089,8 +1268,8 @@ func main() {
 			return
 		}
 		if len(cidrs) == 0 {
-			log.Println("Warning: IP database is empty, no routes to apply")
-			trayUI.SetStatusError("IP 库为空")
+			log.Println("Warning: domestic whitelist resolved to no static routes")
+			trayUI.SetStatusError("国内白名单为空或解析失败")
 			return
 		}
 
@@ -1120,7 +1299,7 @@ func main() {
 		vpnMon.SetState(monitor.StateActive)
 	}
 
-	disconnectSession := func(reason string) error {
+	disconnectSessionContext := func(ctx context.Context, reason string) error {
 		disconnectMu.Lock()
 		defer disconnectMu.Unlock()
 
@@ -1134,11 +1313,11 @@ func main() {
 				log.Printf("OpenConnect TUN disconnect failed: %v", err)
 			}
 		}
-		removed, removeErrors := routeMgr.RemoveAllRoutesContext(context.Background(), cleanupProgress)
+		removed, removeErrors := routeMgr.RemoveAllRoutesContext(ctx, cleanupProgress)
 		log.Printf("Routes cleaned before disconnect: %d removed, %d errors", removed, removeErrors)
 		var err error
 		if cliPath != "" && currentBackend() == config.TrafficBackendCiscoStatic {
-			err = vpn.Disconnect(cliPath)
+			err = vpn.DisconnectContext(ctx, cliPath)
 			if err != nil {
 				log.Printf("VPN disconnect failed: %v", err)
 			}
@@ -1152,6 +1331,7 @@ func main() {
 		resetRouteOps()
 		return err
 	}
+	disconnectSession := func(reason string) error { return disconnectSessionContext(context.Background(), reason) }
 
 	connectFinalSite := func(site ui.Site, username, password, reason string) error {
 		log.Printf("Connecting final site for %s: %s (%s)", reason, site.Name, site.Server)
@@ -1174,9 +1354,43 @@ func main() {
 			trayUI.SetStatusBusy("正在恢复分流...")
 		}
 		connectedSite = site
+		connectedUsername = username
+		connectedPassword = password
 		suppressVPNDetection.Store(false)
 		vpnMon.SetState(monitor.StateConnected)
 		return nil
+	}
+
+	var autoRecoveryRunning atomic.Bool
+	recoverUnexpectedDisconnect := func() {
+		if !autoRecoveryRunning.CompareAndSwap(false, true) {
+			return
+		}
+		go func() {
+			defer autoRecoveryRunning.Store(false)
+			site := connectedSite
+			username := connectedUsername
+			password := connectedPassword
+			if site.Server == "" || username == "" || password == "" {
+				log.Println("Automatic VPN recovery skipped: active credentials are unavailable")
+				return
+			}
+			log.Printf("Automatic VPN recovery started after backend failure: site=%s", site.Name)
+			for attempt := 1; attempt <= 3; attempt++ {
+				if attempt > 1 {
+					time.Sleep(time.Duration(attempt-1) * 2 * time.Second)
+				}
+				if err := connectFinalSite(site, username, password, fmt.Sprintf("automatic recovery attempt %d", attempt)); err == nil {
+					log.Printf("Automatic VPN recovery succeeded on attempt %d", attempt)
+					return
+				} else {
+					log.Printf("Automatic VPN recovery attempt %d failed: %v", attempt, err)
+				}
+			}
+			if trayUI != nil {
+				trayUI.SetStatusError("VPN 已断开，请点击重连")
+			}
+		}()
 	}
 
 	restoreNormalSite := func(reason string) {
@@ -1209,136 +1423,224 @@ func main() {
 				if trayUI != nil {
 					trayUI.SetStatusError("恢复常用线路失败")
 				}
+			} else if trayUI != nil {
+				cfg.CodexModeActive = false
+				_ = cfg.Save()
+				trayUI.SetCodexModeActive(false)
 			}
 		}()
 	}
 
 	switchToCodexMode := func() {
 		go func() {
+			ctx, started := smartUI.begin(context.Background())
+			if !started {
+				return
+			}
+			defer smartUI.finish("")
 			modeSwitchMu.Lock()
 			defer modeSwitchMu.Unlock()
 
 			username, password, err := storedCredential(cfg)
 			if err != nil {
-				log.Printf("Codex mode skipped, saved credential unavailable: %v", err)
-				if trayUI != nil {
-					trayUI.SetStatusError("缺少已保存凭据")
-				}
+				trayUI.SetStatusError("缺少已保存凭据")
 				return
 			}
 			candidates := codexCandidateSites(cfg, sites)
 			if len(candidates) == 0 {
-				log.Println("Codex mode skipped, no candidate sites configured")
-				if trayUI != nil {
-					trayUI.SetStatusError("无 Codex 候选节点")
+				trayUI.SetStatusError("无智能选线候选节点")
+				return
+			}
+			originalSite := connectedSite
+			originalMode := cfg.CodexModeActive
+			if originalSite.Server == "" {
+				trayUI.SetStatusError("当前线路未知")
+				return
+			}
+			if err := smartselect.SaveTransaction(txPath, smartselect.Transaction{Pending: true, OriginalSite: originalSite.Name, OriginalCodexMode: originalMode, StartedAt: time.Now()}); err != nil {
+				trayUI.SetStatusError("无法保存选线恢复点")
+				return
+			}
+			restoreOriginal := func(reason string) bool {
+				smartUI.update("restoring", "正在恢复原线路："+originalSite.Name)
+				_ = disconnectSession(reason)
+				if err := connectFinalSite(originalSite, username, password, reason); err != nil {
+					log.Printf("Smart selection restore failed: %v", err)
+					trayUI.SetStatusError("恢复原线路失败")
+					return false
+				}
+				cfg.CodexModeActive = originalMode
+				_ = cfg.Save()
+				trayUI.SetCodexModeActive(originalMode)
+				return true
+			}
+			suppressVPNDetection.Store(true)
+			defer suppressVPNDetection.Store(false)
+			trayUI.SetStatusBusy("智能选线：复测当前线路 0/3")
+			currentMetrics := smartselect.Evaluate(runSmartProbes(ctx, smartselect.CurrentRounds, func(n int) {
+				smartUI.update("running", fmt.Sprintf("复测当前线路 %d/%d", n, smartselect.CurrentRounds))
+				trayUI.SetStatusBusy(fmt.Sprintf("智能选线：当前线路 %d/3", n))
+			}))
+			currentHealthy := smartselect.CurrentHealthy(currentMetrics)
+			if ctx.Err() != nil {
+				if restoreOriginal("smart selection timeout") {
+					_ = smartselect.ClearTransaction(txPath)
 				}
 				return
 			}
-			normalSite, hasNormalSite := preferredSite(sites, cfg.PreferredSite)
-
-			type candidateResult struct {
-				site    ui.Site
-				results []codexprobe.Result
-				score   int
+			if currentHealthy {
+				smartUI.result("current_healthy", originalSite.Name, currentMetrics)
+				smartUI.update("current_healthy", fmt.Sprintf("当前线路健康：3/3，中位 %d ms，最慢 %d ms", currentMetrics.Median.Milliseconds(), currentMetrics.Slowest.Milliseconds()))
+				trayUI.SetStatusBusy("当前线路健康，等待是否深度检测")
+				select {
+				case decision := <-smartUI.decisions():
+					if decision != "continue" {
+						_ = smartselect.ClearTransaction(txPath)
+						trayUI.SetStatusBusy("当前线路健康，已保持")
+						return
+					}
+				case <-ctx.Done():
+					_ = smartselect.ClearTransaction(txPath)
+					trayUI.SetStatusBusy("当前线路健康，已保持")
+					return
+				}
 			}
-			var best candidateResult
-			best.score = -1 << 30
-			hasBest := false
 
-			suppressVPNDetection.Store(true)
-			defer suppressVPNDetection.Store(false)
-			_ = disconnectSession("codex mode")
-
-			for i, site := range candidates {
-				if trayUI != nil {
-					trayUI.SetStatusBusy(fmt.Sprintf("Codex 测试 %d/%d：%s", i+1, len(candidates), site.Name))
-				}
-				_ = disconnectSession("codex candidate")
-				if trayUI != nil {
-					trayUI.ClearCurrentSite()
-				}
-				log.Printf("Codex candidate connecting: %s (%s)", site.Name, site.Server)
-				cacheServerIPs(site)
-				backend, err := connectWithBestBackend(site, username, password)
-				if err != nil {
-					log.Printf("Codex candidate connect failed for %s: %v", site.Name, err)
+			historyPath := filepath.Join(dataDir, "smart-select-history.json")
+			history, err := smartselect.LoadHistory(historyPath)
+			if err != nil {
+				history = smartselect.History{Version: 1, Sites: map[string]smartselect.Record{}}
+			}
+			if len(history.Sites) == 0 {
+				smartUI.update("running", "正在进行候选线路预筛选")
+				candidates = prefilterSites(ctx, candidates)
+			}
+			names := make([]string, 0, len(candidates))
+			siteByName := map[string]ui.Site{}
+			seenUpstream := map[string]struct{}{serverHostname(originalSite.Server): {}}
+			for _, s := range candidates {
+				upstream := serverHostname(s.Server)
+				if _, duplicate := seenUpstream[upstream]; duplicate {
 					continue
 				}
-				log.Printf("Codex candidate connected with backend: %s", backend)
+				seenUpstream[upstream] = struct{}{}
+				names = append(names, s.Name)
+				siteByName[s.Name] = s
+			}
+			ranked := smartselect.Rank(names, originalSite.Name, history, time.Now())
+			var recommended ui.Site
+			var recommendedMetrics smartselect.Metrics
+			for i, name := range ranked {
+				if ctx.Err() != nil {
+					break
+				}
+				site := siteByName[name]
+				smartUI.update("running", fmt.Sprintf("检测候选 %d/%d：%s", i+1, len(ranked), site.Name))
+				trayUI.SetStatusBusy(fmt.Sprintf("智能选线 %d/%d：%s", i+1, len(ranked), site.Name))
+				_ = disconnectSessionContext(ctx, "smart selection candidate")
+				if ctx.Err() != nil {
+					break
+				}
+				cacheServerIPs(site)
+				if _, err := connectWithBestBackendContext(ctx, site, username, password); err != nil {
+					history.Record(site.Name, smartselect.Metrics{}, false, time.Now())
+					continue
+				}
 				connectedSite = site
-				if trayUI != nil {
-					trayUI.SetCurrentSite(site.Name)
-				}
-
-				results := probeCodex(cfg.CodexProbeAttempts)
-				score := codexprobe.Score(results)
-				healthy := codexprobe.AllHealthy(results)
-				for n, result := range results {
-					log.Printf(
-						"Codex probe %s #%d: status=%d duration=%s cf_ray=%s mitigated=%s err=%s",
-						site.Name,
-						n+1,
-						result.Status,
-						result.Duration.Round(time.Millisecond),
-						result.CFRay,
-						result.CFMitigated,
-						result.Error,
-					)
-				}
-				log.Printf("Codex candidate result: site=%s healthy=%v score=%d median=%s",
-					site.Name, healthy, score, codexprobe.MedianDuration(results).Round(time.Millisecond))
-
-				if healthy && score > best.score {
-					best = candidateResult{site: site, results: results, score: score}
-					hasBest = true
-				}
-				if healthy && !cfg.CodexAutoSelect {
+				connectedUsername = username
+				connectedPassword = password
+				trayUI.SetCurrentSite(site.Name)
+				metrics := smartselect.Evaluate(runSmartProbes(ctx, smartselect.CandidateRounds, nil))
+				validExit := currentMetrics.ExitIP == "" || metrics.ExitIP != currentMetrics.ExitIP
+				qualified := smartselect.CandidateQualified(metrics) && validExit
+				history.Record(site.Name, metrics, qualified, time.Now())
+				_ = history.Save(historyPath)
+				if qualified {
+					if currentHealthy && !smartselect.MateriallyBetter(currentMetrics, metrics) {
+						break
+					}
+					recommended, recommendedMetrics = site, metrics
 					break
 				}
 			}
-
-			if !hasBest {
-				log.Println("Codex mode found no healthy site")
-				if hasNormalSite {
-					_ = disconnectSession("restore after codex probe failure")
-					if err := connectFinalSite(normalSite, username, password, "restore after codex probe failure"); err != nil {
-						log.Printf("Failed to restore normal site after Codex probe failure: %v", err)
-					}
+			if recommended.Server == "" {
+				if restoreOriginal("smart selection no trusted result") {
+					_ = smartselect.ClearTransaction(txPath)
 				}
-				if trayUI != nil {
-					trayUI.SetStatusError("Codex 节点检测失败")
-				}
+				trayUI.SetStatusError("没有可信推荐，已恢复原线路")
 				return
 			}
-
-			_ = disconnectSession("codex final")
-			if err := connectFinalSite(best.site, username, password, "codex mode final"); err != nil {
-				log.Printf("Codex final connect failed for %s: %v", best.site.Name, err)
-				if hasNormalSite {
-					_ = disconnectSession("restore after codex final failure")
-					if restoreErr := connectFinalSite(normalSite, username, password, "restore after codex final failure"); restoreErr != nil {
-						log.Printf("Failed to restore normal site after Codex final failure: %v", restoreErr)
-					}
-				}
-				if trayUI != nil {
-					trayUI.SetStatusError("Codex 线路连接失败")
-				}
-				return
+			smartUI.result("recommendation", recommended.Name, recommendedMetrics)
+			smartUI.update("recommendation", "已找到严格通过的推荐线路")
+			trayUI.SetStatusBusy("智能选线完成，等待确认")
+			var decision string
+			select {
+			case decision = <-smartUI.decisions():
+			case <-time.After(smartselect.DecisionCountdown):
+				decision = "accept"
 			}
-
-			cfg.CodexPreferredSite = best.site.Name
-			_ = cfg.Save()
-			log.Printf("Codex mode selected site: %s score=%d median=%s",
-				best.site.Name, best.score, codexprobe.MedianDuration(best.results).Round(time.Millisecond))
+			if decision == "accept" {
+				cfg.CodexPreferredSite, cfg.CodexModeActive = recommended.Name, true
+				if err := cfg.Save(); err != nil {
+					log.Printf("Failed to persist recommended line: %v", err)
+					cfg.CodexModeActive = originalMode
+					if restoreOriginal("smart selection persistence failure") {
+						_ = smartselect.ClearTransaction(txPath)
+					}
+					return
+				}
+				r := history.Sites[recommended.Name]
+				r.LastSelected = time.Now()
+				history.Sites[recommended.Name] = r
+				_ = history.Save(historyPath)
+				trayUI.SetCodexModeActive(true)
+				trayUI.SetStatusBusy("已采用推荐线路：" + recommended.Name)
+				_ = smartselect.ClearTransaction(txPath)
+			} else if restoreOriginal("smart selection restore decision") {
+				_ = smartselect.ClearTransaction(txPath)
+			}
 		}()
 	}
 
 	// Define tray actions
+	refreshRoutesIfConnected := func() {
+		go func() {
+			state := vpnMon.State()
+			if state != monitor.StateActive && state != monitor.StateConnected {
+				return
+			}
+			if usingTun() && !tunSession.Active() {
+				return
+			}
+			if trayUI != nil {
+				if usingTun() {
+					trayUI.SetStatusBusy("正在刷新国外白名单路由...")
+				} else {
+					trayUI.SetStatusBusy("正在刷新国外白名单路由...")
+				}
+			}
+			resetRouteOps()
+			applySplitRoutes(true)
+		}()
+	}
+
 	actions := tray.Actions{
 		OnDisconnect: func() error {
-			return disconnectSession("tray menu")
+			if smartUI.isRunning() {
+				trayUI.SetStatusBusy("智能选线进行中，请先取消")
+				return nil
+			}
+			err := disconnectSession("tray menu")
+			if err == nil && trayUI != nil {
+				trayUI.SetCodexModeActive(false)
+			}
+			return err
 		},
 		OnReconnect: func() {
+			if smartUI.isRunning() {
+				trayUI.SetStatusBusy("智能选线进行中，请先取消")
+				return
+			}
 			log.Println("Reconnecting VPN...")
 			disconnectSession("reconnect")
 			selectedSite, username, password, ok := connectionInput(cfg, sites, false)
@@ -1347,7 +1649,7 @@ func main() {
 				return
 			}
 			resetRouteOps()
-			log.Printf("Reconnecting to %s (%s) as %s", selectedSite.Name, selectedSite.Server, username)
+			log.Printf("Reconnecting to %s (%s)", selectedSite.Name, selectedSite.Server)
 			cacheServerIPs(selectedSite)
 			backend, err := connectWithBestBackend(selectedSite, username, password)
 			if err != nil {
@@ -1357,39 +1659,65 @@ func main() {
 			}
 			log.Printf("Reconnected with backend: %s", backend)
 			connectedSite = selectedSite
+			connectedUsername = username
+			connectedPassword = password
 			trayUI.SetCurrentSite(selectedSite.Name)
+			cfg.CodexModeActive = false
+			_ = cfg.Save()
+			trayUI.SetCodexModeActive(false)
 			vpnMon.SetState(monitor.StateConnected)
 		},
 		OnCodexMode: func() {
-			log.Println("Codex stable mode requested")
+			log.Println("ChatGPT/Codex smart selection requested")
 			switchToCodexMode()
 		},
 		OnRestoreNormal: func() {
+			if smartUI.isRunning() {
+				trayUI.SetStatusBusy("智能选线进行中，请先取消")
+				return
+			}
 			log.Println("Restore normal site requested")
 			restoreNormalSite("restore normal")
 		},
-		OnToggleSplit: func(enabled bool) {
-			trayUI.SetSplitEnabled(enabled)
-			cfg.SplitTunnelEnabled = enabled
-			cfg.Save()
-			if usingTun() {
+		OnSetSplitMode: func(mode string) {
+			if smartUI.isRunning() {
+				trayUI.SetStatusBusy("智能选线进行中，请先取消")
+				return
+			}
+			go func() {
+				splitModeChangeMu.Lock()
+				defer splitModeChangeMu.Unlock()
+
+				changed, err := persistSplitMode(cfg, mode, cfg.Save)
+				if err != nil {
+					log.Printf("Failed to save split mode %q: %v", mode, err)
+					trayUI.SetStatusError("分流模式保存失败")
+					return
+				}
+				if !changed {
+					return
+				}
+
+				tunSession.SetSplitMode(cfg.SplitMode)
+				trayUI.SetSplitMode(cfg.SplitMode)
+				log.Printf("Split mode changed to %s", cfg.SplitMode)
+
+				if !cfg.SplitTunnelEnabled {
+					return
+				}
+				state := vpnMon.State()
+				if state != monitor.StateActive && state != monitor.StateConnected {
+					return
+				}
+				if usingTun() && !tunSession.Active() {
+					trayUI.SetStatusBusy("分流模式已保存，重新连接后生效")
+					return
+				}
+
+				trayUI.SetStatusBusy("正在切换分流模式...")
 				resetRouteOps()
 				applySplitRoutes(true)
-				return
-			}
-			if !enabled {
-				cancelActiveRouteOps()
-				if routeMgr.HasAppliedRoutes() {
-					routeMgr.RemoveAllRoutesContext(context.Background(), cleanupProgress)
-					log.Println("Split tunnel disabled, routes removed")
-				}
-				trayUI.SetStatusSplitDisabled()
-				return
-			}
-			if enabled {
-				resetRouteOps()
-				applySplitRoutes(false)
-			}
+			}()
 		},
 		OnUpdateIPDB: func() {
 			go func() {
@@ -1435,6 +1763,34 @@ func main() {
 		},
 		OnViewLog: func() {
 			exec.Command("notepad", logFile).Start()
+		},
+		OnAddForeignDomain: func(domain string) bool {
+			if !cfg.AddForeignDomain(domain) {
+				return false
+			}
+			if tunSession != nil {
+				tunSession.SetForeignWhitelist(cfg.ForeignDomains, cfg.ForeignCIDRs)
+			}
+			if err := cfg.Save(); err != nil {
+				log.Printf("Failed to save config after adding foreign domain: %v", err)
+			}
+			log.Printf("Added foreign domain to whitelist: %s", domain)
+			refreshRoutesIfConnected()
+			return true
+		},
+		OnAddForeignCIDR: func(cidr string) bool {
+			if !cfg.AddForeignCIDR(cidr) {
+				return false
+			}
+			if tunSession != nil {
+				tunSession.SetForeignWhitelist(cfg.ForeignDomains, cfg.ForeignCIDRs)
+			}
+			if err := cfg.Save(); err != nil {
+				log.Printf("Failed to save config after adding foreign CIDR: %v", err)
+			}
+			log.Printf("Added foreign IP/CIDR to whitelist: %s", cidr)
+			refreshRoutesIfConnected()
+			return true
 		},
 		OnToggleAuto: func(enabled bool) error {
 			if err := setAutoStart(enabled); err != nil {
@@ -1492,12 +1848,40 @@ func main() {
 		OnRestoreNormal: func() {
 			actions.OnRestoreNormal()
 		},
-		OnToggleSplit: func(enabled bool) {
-			go actions.OnToggleSplit(enabled)
+		OnSetSplitMode: func(mode string) {
+			actions.OnSetSplitMode(mode)
 		},
 		OnUpdateIPDB: func() {
 			actions.OnUpdateIPDB()
 		},
+		OnAddForeignDomain: func(value string) {
+			actions.OnAddForeignDomain(value)
+		},
+		OnAddForeignCIDR: func(value string) {
+			actions.OnAddForeignCIDR(value)
+		},
+		OnRemoveForeignDomain: func(value string) {
+			if cfg.RemoveForeignDomain(value) {
+				_ = cfg.Save()
+				if usingTun() {
+					tunSession.SetForeignWhitelist(cfg.ForeignDomains, cfg.ForeignCIDRs)
+				}
+				refreshRoutesIfConnected()
+			}
+		},
+		OnRemoveForeignCIDR: func(value string) {
+			if cfg.RemoveForeignCIDR(value) {
+				_ = cfg.Save()
+				if usingTun() {
+					tunSession.SetForeignWhitelist(cfg.ForeignDomains, cfg.ForeignCIDRs)
+				}
+				refreshRoutesIfConnected()
+			}
+		},
+		OnSmartContinue: func() { smartUI.choose("continue") },
+		OnSmartCancel:   func() { smartUI.choose("restore"); smartUI.stop() },
+		OnSmartAccept:   func() { smartUI.choose("accept") },
+		OnSmartRestore:  func() { smartUI.choose("restore") },
 		OnViewLog: func() {
 			actions.OnViewLog()
 		},
@@ -1545,6 +1929,7 @@ func main() {
 				trayUI.SetStatusIdle()
 				resetRouteOps()
 				vpnMon.SetState(monitor.StateIdle)
+				recoverUnexpectedDisconnect()
 			}
 		}
 	}()

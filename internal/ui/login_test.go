@@ -1,6 +1,25 @@
 package ui
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+func TestLoginContactSectionScript(t *testing.T) {
+	script := loginContactSectionScript(`C:\Program Files\AnyConnect Split Tunnel\ui-assets\wechat-contact-qr.png`)
+
+	for _, want := range []string{
+		"联系作者",
+		"微信扫码添加作者",
+		"PictureBox",
+		"wechat-contact-qr.png",
+		"二维码加载失败",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("login contact script missing %q", want)
+		}
+	}
+}
 
 func TestLoginDefaultSiteAvoidsDomesticPreferred(t *testing.T) {
 	sites := []Site{

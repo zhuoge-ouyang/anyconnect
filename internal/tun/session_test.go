@@ -231,6 +231,102 @@ func TestBuildSingBoxConfigFullTunnelOmitsCNRules(t *testing.T) {
 	}
 }
 
+func TestBuildSingBoxConfigDomesticDirectFullTunnelUsesVPN(t *testing.T) {
+	data, err := BuildSingBoxConfig(ConfigOptions{
+		LocalInterface: "Wi-Fi",
+		VPNInterface:   "OpenConnect",
+		ForeignDomains: []string{"chatgpt.com"},
+		SplitMode:      "domestic_direct",
+		SplitEnabled:   false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	routeCfg := cfg["route"].(map[string]any)
+	if routeCfg["final"] != "vpn-direct" {
+		t.Fatalf("route.final = %v, want vpn-direct when split tunneling is disabled", routeCfg["final"])
+	}
+	dnsCfg := cfg["dns"].(map[string]any)
+	if dnsCfg["final"] != "dns-vpn" {
+		t.Fatalf("dns.final = %v, want dns-vpn when split tunneling is disabled", dnsCfg["final"])
+	}
+	if _, hasRules := dnsCfg["rules"]; hasRules {
+		t.Fatal("full tunnel mode should not retain split DNS rules")
+	}
+}
+
+func TestBuildSingBoxConfigDomesticDirectDefaultsToDirect(t *testing.T) {
+	data, err := BuildSingBoxConfig(ConfigOptions{
+		LocalInterface: "Wi-Fi",
+		VPNInterface:   "OpenConnect",
+		ForeignCIDRs:   []string{"1.2.3.0/24", "1.2.3.0/24"},
+		ForeignDomains: []string{"openai.com", "openai.com"},
+		SplitMode:      "domestic_direct",
+		SplitEnabled:   true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	routeCfg := cfg["route"].(map[string]any)
+	// domestic_direct: default traffic is direct, only foreign whitelist via VPN.
+	if routeCfg["final"] != "direct-local" {
+		t.Fatalf("route.final = %v, want direct-local", routeCfg["final"])
+	}
+	rules := routeCfg["rules"].([]any)
+	if len(rules) != 5 {
+		t.Fatalf("len(rules) = %d, want hijack-dns + private + foreign-cidr + foreign-domain + udp 443 reject", len(rules))
+	}
+	// Foreign CIDR rule must route to vpn-direct.
+	cidrRule := rules[2].(map[string]any)
+	if cidrRule["outbound"] != "vpn-direct" {
+		t.Fatalf("foreign cidr outbound = %v, want vpn-direct", cidrRule["outbound"])
+	}
+	cidrs := cidrRule["ip_cidr"].([]any)
+	if len(cidrs) != 1 {
+		t.Fatalf("len(ip_cidr) = %d, want deduped 1", len(cidrs))
+	}
+	// Foreign domain rule must route to vpn-direct.
+	domainRule := rules[3].(map[string]any)
+	if domainRule["outbound"] != "vpn-direct" {
+		t.Fatalf("foreign domain outbound = %v, want vpn-direct", domainRule["outbound"])
+	}
+	// DNS final should be dns-local (default direct), foreign domains via dns-vpn.
+	dnsCfg := cfg["dns"].(map[string]any)
+	if dnsCfg["final"] != "dns-local" {
+		t.Fatalf("dns.final = %v, want dns-local", dnsCfg["final"])
+	}
+	dnsRules := dnsCfg["rules"].([]any)
+	rule0 := dnsRules[0].(map[string]any)
+	if rule0["server"] != "dns-vpn" {
+		t.Fatalf("dns rule server = %v, want dns-vpn for foreign domains", rule0["server"])
+	}
+}
+
+func TestSessionSetSplitModeValidatesAndUpdatesOptions(t *testing.T) {
+	s := New(Options{SplitMode: "domestic_direct"})
+
+	if !s.SetSplitMode(" FOREIGN_DIRECT ") {
+		t.Fatal("SetSplitMode rejected a supported mode")
+	}
+	if s.opts.SplitMode != "foreign_direct" {
+		t.Fatalf("session split mode = %q, want foreign_direct", s.opts.SplitMode)
+	}
+	if s.SetSplitMode("invalid") {
+		t.Fatal("SetSplitMode accepted an unsupported mode")
+	}
+	if s.opts.SplitMode != "foreign_direct" {
+		t.Fatalf("invalid update changed session split mode to %q", s.opts.SplitMode)
+	}
+}
+
 func TestDetectExecutableUsesConfiguredPath(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "openconnect.exe")
@@ -256,6 +352,50 @@ func TestPresenceReportsDisconnectedWhenChildProcessesExited(t *testing.T) {
 
 	if got := session.Presence(); got != monitor.PresenceDisconnected {
 		t.Fatalf("Presence() = %s, want %s", got, monitor.PresenceDisconnected)
+	}
+}
+
+func TestResolveLocalInterfaceRefreshesStalePersistedIndex(t *testing.T) {
+	route, err := monitor.GetDefaultRoute()
+	if err != nil {
+		t.Skipf("default route unavailable in test environment: %v", err)
+	}
+	iface, err := net.InterfaceByIndex(route.InterfaceIndex)
+	if err != nil || iface == nil {
+		t.Skipf("default route interface unavailable in test environment: %v", err)
+	}
+
+	session := &Session{opts: Options{
+		LocalGateway:        "192.0.2.1",
+		LocalInterfaceIndex: 2147483647,
+	}}
+
+	got, err := session.resolveLocalInterfaceName()
+	if err != nil {
+		t.Fatalf("resolveLocalInterfaceName() returned error: %v", err)
+	}
+	if got != iface.Name {
+		t.Fatalf("resolveLocalInterfaceName() = %q, want current default interface %q", got, iface.Name)
+	}
+	if session.opts.LocalGateway != route.Gateway {
+		t.Fatalf("session local gateway = %q, want refreshed gateway %q", session.opts.LocalGateway, route.Gateway)
+	}
+	if session.opts.LocalInterfaceIndex != route.InterfaceIndex {
+		t.Fatalf("session interface index = %d, want refreshed index %d", session.opts.LocalInterfaceIndex, route.InterfaceIndex)
+	}
+}
+
+func TestPresenceReportsDisconnectedWhenOneBackendDies(t *testing.T) {
+	singBoxDone := make(chan error)
+	close(singBoxDone)
+	session := &Session{
+		openConnectCmd: &exec.Cmd{},
+		singBoxCmd:     &exec.Cmd{},
+		singBoxDone:    singBoxDone,
+	}
+
+	if got := session.Presence(); got != monitor.PresenceDisconnected {
+		t.Fatalf("Presence() = %s, want %s for a partial TUN backend", got, monitor.PresenceDisconnected)
 	}
 }
 

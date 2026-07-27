@@ -9,29 +9,34 @@ import (
 	"time"
 
 	"github.com/getlantern/systray"
+	"github.com/user/anyconnect-split/internal/config"
 )
 
 type Actions struct {
-	OnDisconnect    func() error
-	OnReconnect     func()
-	OnCodexMode     func()
-	OnRestoreNormal func()
-	OnToggleSplit   func(enabled bool)
-	OnUpdateIPDB    func()
-	OnViewLog       func()
-	OnToggleAuto    func(enabled bool) error
-	OnOpenDashboard func()
-	OnContactAuthor func()
-	OnQuit          func()
+	OnDisconnect       func() error
+	OnReconnect        func()
+	OnCodexMode        func()
+	OnRestoreNormal    func()
+	OnSetSplitMode     func(mode string)
+	OnUpdateIPDB       func()
+	OnAddForeignDomain func(domain string) bool
+	OnAddForeignCIDR   func(cidr string) bool
+	OnViewLog          func()
+	OnToggleAuto       func(enabled bool) error
+	OnOpenDashboard    func()
+	OnContactAuthor    func()
+	OnQuit             func()
 }
 
 type Status struct {
-	StatusText   string
-	CurrentSite  string
-	RouteCount   int
-	SplitEnabled bool
-	AutoStart    bool
-	LastError    string
+	StatusText      string
+	CurrentSite     string
+	RouteCount      int
+	SplitEnabled    bool
+	SplitMode       string
+	AutoStart       bool
+	CodexModeActive bool
+	LastError       string
 }
 
 type Tray struct {
@@ -46,30 +51,39 @@ type Tray struct {
 	menuReconnect     *systray.MenuItem
 	menuCodex         *systray.MenuItem
 	menuRestore       *systray.MenuItem
-	menuToggle        *systray.MenuItem
+	menuSplitMode     *systray.MenuItem
+	menuDomesticMode  *systray.MenuItem
+	menuForeignMode   *systray.MenuItem
 	menuUpdate        *systray.MenuItem
+	menuAddDomain     *systray.MenuItem
+	menuAddIP         *systray.MenuItem
 	menuLog           *systray.MenuItem
 	menuAutoStart     *systray.MenuItem
 	menuContactAuthor *systray.MenuItem
 	menuQuit          *systray.MenuItem
 	iconAnimator      *trayIconAnimator
 	splitEnabled      bool
+	splitMode         string
 	autoStart         bool
+	codexModeActive   bool
 	currentSite       string
 	initialTooltip    string
 	ready             chan struct{}
 	quitOnce          sync.Once
 }
 
-func New(actions Actions, splitEnabled bool, autoStart bool) *Tray {
+func New(actions Actions, autoStart bool) *Tray {
 	return &Tray{
 		actions:      actions,
-		splitEnabled: splitEnabled,
+		splitEnabled: true,
+		splitMode:    config.SplitModeDomesticDirect,
 		autoStart:    autoStart,
 		status: Status{
-			StatusText:   "状态：VPN 未连接",
-			SplitEnabled: splitEnabled,
-			AutoStart:    autoStart,
+			StatusText:      "状态：VPN 未连接",
+			SplitEnabled:    true,
+			SplitMode:       config.SplitModeDomesticDirect,
+			AutoStart:       autoStart,
+			CodexModeActive: false,
 		},
 		iconAnimator: newTrayIconAnimator(nil),
 		ready:        make(chan struct{}),
@@ -110,7 +124,9 @@ func (t *Tray) SetStatusFields(text string, routeCount int, lastError string) {
 	t.status.CurrentSite = t.currentSite
 	t.status.RouteCount = routeCount
 	t.status.SplitEnabled = t.splitEnabled
+	t.status.SplitMode = t.splitMode
 	t.status.AutoStart = t.autoStart
+	t.status.CodexModeActive = t.codexModeActive
 	t.status.LastError = lastError
 	listener := t.statusListener
 	status := t.status
@@ -163,12 +179,25 @@ func (t *Tray) onReady() {
 
 	t.menuDisconnect = systray.AddMenuItem("断开 VPN", "断开当前 VPN 连接")
 	t.menuReconnect = systray.AddMenuItem("重新连接", "使用新凭据重新连接")
-	t.menuCodex = systray.AddMenuItem("切到 Codex 稳定线路", "自动选择对 Codex 不返回 403 的线路")
+	t.menuCodex = systray.AddMenuItem("ChatGPT/Codex 智能选线", "最多 60 秒，严格验证后由你确认或倒计时采用")
 	t.menuRestore = systray.AddMenuItem("恢复常用线路", "切回配置中的常用 VPN 节点")
 	systray.AddSeparator()
 
-	t.menuToggle = systray.AddMenuItemCheckbox("启用分流", "切换分流模式", t.splitEnabled)
+	domesticChecked, foreignChecked := splitModeChecks(t.splitMode)
+	t.menuSplitMode = systray.AddMenuItem("分流模式", "选择默认流量路径")
+	t.menuDomesticMode = t.menuSplitMode.AddSubMenuItemCheckbox(
+		"国内直连优先",
+		"默认使用本地网络，仅国外白名单走 VPN",
+		domesticChecked,
+	)
+	t.menuForeignMode = t.menuSplitMode.AddSubMenuItemCheckbox(
+		"国外 VPN 优先",
+		"默认使用 VPN，仅国内白名单直连",
+		foreignChecked,
+	)
 	t.menuUpdate = systray.AddMenuItem("更新 IP 数据库", "下载最新国内 IP 列表")
+	t.menuAddDomain = systray.AddMenuItem("添加国外域名…", "快速添加一个国外域名到 VPN 白名单")
+	t.menuAddIP = systray.AddMenuItem("添加国外 IP/CIDR…", "快速添加一个国外 IP 或 CIDR 到 VPN 白名单")
 	t.menuLog = systray.AddMenuItem("查看日志", "打开日志文件")
 	systray.AddSeparator()
 
@@ -182,12 +211,12 @@ func (t *Tray) onReady() {
 
 	if a := t.getActions(); a.OnOpenDashboard != nil {
 		systray.SetIconClickHandler(func(left bool) {
-			button := IconButtonLeft
+			button := iconButtonFromClick(left)
 			switch ResolveIconClickAction(button, true) {
 			case IconClickOpenDashboard:
 				a := t.getActions()
 				if a.OnOpenDashboard != nil {
-					a.OnOpenDashboard()
+					go a.OnOpenDashboard()
 				}
 			}
 		})
@@ -241,22 +270,19 @@ func (t *Tray) handleClicks() {
 			if a.OnRestoreNormal != nil {
 				a.OnRestoreNormal()
 			}
-		case <-t.menuToggle.ClickedCh:
-			t.splitEnabled = !t.splitEnabled
-			if t.splitEnabled {
-				t.menuToggle.Check()
-			} else {
-				t.menuToggle.Uncheck()
-			}
-			a := t.getActions()
-			if a.OnToggleSplit != nil {
-				a.OnToggleSplit(t.splitEnabled)
-			}
+		case <-t.menuDomesticMode.ClickedCh:
+			t.requestSplitMode(config.SplitModeDomesticDirect)
+		case <-t.menuForeignMode.ClickedCh:
+			t.requestSplitMode(config.SplitModeForeignDirect)
 		case <-t.menuUpdate.ClickedCh:
 			a := t.getActions()
 			if a.OnUpdateIPDB != nil {
 				a.OnUpdateIPDB()
 			}
+		case <-t.menuAddDomain.ClickedCh:
+			t.promptAddForeignDomain()
+		case <-t.menuAddIP.ClickedCh:
+			t.promptAddForeignCIDR()
 		case <-t.menuLog.ClickedCh:
 			a := t.getActions()
 			if a.OnViewLog != nil {
@@ -316,6 +342,54 @@ func (t *Tray) requestQuit() {
 	})
 }
 
+func (t *Tray) promptAddForeignDomain() {
+	value, ok := PromptInput("添加国外域名", "请输入国外域名（如 openai.com）：")
+	if !ok {
+		return
+	}
+	a := t.getActions()
+	if a.OnAddForeignDomain == nil {
+		return
+	}
+	if a.OnAddForeignDomain(value) {
+		notifyInfo("已添加国外域名", "已加入白名单并保存，已连接时将自动刷新路由。")
+	} else {
+		notifyInfo("添加国外域名", "域名格式无效或已存在，未做更改。")
+	}
+}
+
+func (t *Tray) requestSplitMode(mode string) {
+	normalized, ok := config.NormalizeSplitMode(mode)
+	if !ok || normalized == t.splitMode {
+		return
+	}
+	a := t.getActions()
+	if a.OnSetSplitMode != nil {
+		a.OnSetSplitMode(normalized)
+	}
+}
+
+func (t *Tray) promptAddForeignCIDR() {
+	value, ok := PromptInput("添加国外 IP/CIDR", "请输入国外 IP 或 CIDR（如 1.2.3.0/24）：")
+	if !ok {
+		return
+	}
+	a := t.getActions()
+	if a.OnAddForeignCIDR == nil {
+		return
+	}
+	if a.OnAddForeignCIDR(value) {
+		notifyInfo("已添加国外 IP/CIDR", "已加入白名单并保存，已连接时将自动刷新路由。")
+	} else {
+		notifyInfo("添加国外 IP/CIDR", "IP/CIDR 格式无效或已存在，未做更改。")
+	}
+}
+
+func notifyInfo(title, message string) {
+	script := `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('` + escapePS(message) + `', '` + escapePS(title) + `', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)`
+	exec.Command("powershell", "-NoProfile", "-Command", script).Start()
+}
+
 func (t *Tray) siteLabel() string {
 	site := strings.TrimSpace(t.currentSite)
 	if site == "" {
@@ -340,7 +414,9 @@ func (t *Tray) refreshSiteDisplay() {
 	t.statusMu.Lock()
 	t.status.CurrentSite = strings.TrimSpace(t.currentSite)
 	t.status.SplitEnabled = t.splitEnabled
+	t.status.SplitMode = t.splitMode
 	t.status.AutoStart = t.autoStart
+	t.status.CodexModeActive = t.codexModeActive
 	listener := t.statusListener
 	status := t.status
 	t.statusMu.Unlock()
@@ -366,6 +442,8 @@ func (t *Tray) refreshSiteDisplay() {
 	if t.menuRestore != nil {
 		t.menuRestore.SetTooltip("切回配置中的常用 VPN 节点（当前站点：" + site + "）")
 	}
+	t.refreshModeActionVisibility()
+	t.refreshSplitModeChecks()
 }
 
 func (t *Tray) SetCurrentSite(site string) {
@@ -377,16 +455,39 @@ func (t *Tray) ClearCurrentSite() {
 	t.SetCurrentSite("")
 }
 
-func (t *Tray) SetSplitEnabled(enabled bool) {
-	t.splitEnabled = enabled
-	if t.menuToggle != nil {
-		if enabled {
-			t.menuToggle.Check()
+func (t *Tray) SetSplitMode(mode string) {
+	normalized, ok := config.NormalizeSplitMode(mode)
+	if !ok {
+		return
+	}
+	t.splitMode = normalized
+	t.refreshSiteDisplay()
+}
+
+func splitModeChecks(mode string) (domestic bool, foreign bool) {
+	normalized, ok := config.NormalizeSplitMode(mode)
+	if !ok {
+		return false, false
+	}
+	return normalized == config.SplitModeDomesticDirect, normalized == config.SplitModeForeignDirect
+}
+
+func (t *Tray) refreshSplitModeChecks() {
+	domestic, foreign := splitModeChecks(t.splitMode)
+	if t.menuDomesticMode != nil {
+		if domestic {
+			t.menuDomesticMode.Check()
 		} else {
-			t.menuToggle.Uncheck()
+			t.menuDomesticMode.Uncheck()
 		}
 	}
-	t.refreshSiteDisplay()
+	if t.menuForeignMode != nil {
+		if foreign {
+			t.menuForeignMode.Check()
+		} else {
+			t.menuForeignMode.Uncheck()
+		}
+	}
 }
 
 func (t *Tray) SetAutoStartEnabled(enabled bool) {
@@ -399,6 +500,33 @@ func (t *Tray) SetAutoStartEnabled(enabled bool) {
 		}
 	}
 	t.refreshSiteDisplay()
+}
+
+func (t *Tray) SetCodexModeActive(active bool) {
+	t.codexModeActive = active
+	t.refreshSiteDisplay()
+}
+
+func modeActionVisibility(codexModeActive bool) (showCodex bool, showRestore bool) {
+	return !codexModeActive, codexModeActive
+}
+
+func (t *Tray) refreshModeActionVisibility() {
+	showCodex, showRestore := modeActionVisibility(t.codexModeActive)
+	if t.menuCodex != nil {
+		if showCodex {
+			t.menuCodex.Show()
+		} else {
+			t.menuCodex.Hide()
+		}
+	}
+	if t.menuRestore != nil {
+		if showRestore {
+			t.menuRestore.Show()
+		} else {
+			t.menuRestore.Hide()
+		}
+	}
 }
 
 func (t *Tray) SetStatusIdle() {

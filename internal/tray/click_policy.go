@@ -28,3 +28,10 @@ func ResolveIconClickAction(button IconButton, hasDashboardHandler bool) IconCli
 		return IconClickIgnore
 	}
 }
+
+func iconButtonFromClick(left bool) IconButton {
+	if left {
+		return IconButtonLeft
+	}
+	return IconButtonRight
+}

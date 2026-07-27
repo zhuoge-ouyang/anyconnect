@@ -379,18 +379,52 @@ type Manager struct {
 	dataDir              string
 	appliedRoutes        []string
 	appliedRouteFamilies map[string]int
-	mu                   sync.Mutex
+	// VPN route target (for domestic_direct mode: foreign whitelist via VPN).
+	vpnGateway              string
+	vpnInterfaceIndex       int
+	appliedVPNRoutes        []string
+	appliedVPNRouteFamilies map[string]int
+	mu                      sync.Mutex
 }
 
 func NewManager(gateway string, interfaceIndex int, ipv6Gateway string, ipv6InterfaceIndex int, dataDir string) *Manager {
 	return &Manager{
-		gateway:              gateway,
-		interfaceIndex:       interfaceIndex,
-		ipv6Gateway:          ipv6Gateway,
-		ipv6InterfaceIndex:   ipv6InterfaceIndex,
-		dataDir:              dataDir,
-		appliedRouteFamilies: make(map[string]int),
+		gateway:                 gateway,
+		interfaceIndex:          interfaceIndex,
+		ipv6Gateway:             ipv6Gateway,
+		ipv6InterfaceIndex:      ipv6InterfaceIndex,
+		dataDir:                 dataDir,
+		appliedRouteFamilies:    make(map[string]int),
+		appliedVPNRouteFamilies: make(map[string]int),
 	}
+}
+
+// SetLocalRoute updates the physical default route used for direct/bypass
+// routes. Windows may assign a different interface index after reboot or an
+// adapter reconnect, so callers should refresh this before a new connection.
+func (m *Manager) SetLocalRoute(gateway string, interfaceIndex int, ipv6Gateway string, ipv6InterfaceIndex int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.gateway = gateway
+	m.interfaceIndex = interfaceIndex
+	m.ipv6Gateway = ipv6Gateway
+	m.ipv6InterfaceIndex = ipv6InterfaceIndex
+}
+
+// SetVPNRouteTarget configures the gateway and interface used for VPN routes
+// (foreign whitelist traffic in domestic_direct mode).
+func (m *Manager) SetVPNRouteTarget(gateway string, interfaceIndex int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.vpnGateway = gateway
+	m.vpnInterfaceIndex = interfaceIndex
+}
+
+// HasVPNRouteTarget reports whether a VPN gateway/interface has been configured.
+func (m *Manager) HasVPNRouteTarget() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.vpnGateway != "" && m.vpnInterfaceIndex > 0
 }
 
 func runHidden(ctx context.Context, name string, args ...string) error {
@@ -463,10 +497,50 @@ func (m *Manager) AddRoutes(cidrs []string) (added int, errors int) {
 func (m *Manager) AddRoutesContext(ctx context.Context, cidrs []string, progress ProgressFunc) (added int, errors int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.addRoutesLocked(ctx, cidrs, progress, routeTarget{
+		gatewayFor:   m.gatewayFor,
+		interfaceFor: m.interfaceIndexFor,
+		track:        m.trackRoute,
+		save:         m.saveAppliedRoutes,
+	})
+}
 
+// AddVPNRoutes adds routes that point through the VPN gateway/interface (used
+// in domestic_direct mode to route foreign whitelist traffic via VPN).
+func (m *Manager) AddVPNRoutes(cidrs []string) (added int, errors int) {
+	return m.AddVPNRoutesContext(context.Background(), cidrs, nil)
+}
+
+func (m *Manager) AddVPNRoutesContext(ctx context.Context, cidrs []string, progress ProgressFunc) (added int, errors int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.vpnGateway == "" || m.vpnInterfaceIndex <= 0 {
+		log.Printf("Skip VPN route add: VPN route target not configured")
+		return 0, len(cidrs)
+	}
+	return m.addRoutesLocked(ctx, cidrs, progress, routeTarget{
+		gatewayFor:   m.vpnGatewayFor,
+		interfaceFor: m.vpnInterfaceIndexFor,
+		track:        m.trackVPNRoute,
+		save:         m.saveAppliedVPNRoutes,
+	})
+}
+
+// routeTarget describes how to add/track a set of routes for a particular
+// gateway target (bypass via original gateway, or VPN).
+type routeTarget struct {
+	gatewayFor   func(cidr string) string
+	interfaceFor func(cidr string) int
+	track        func(cidr string, family int)
+	save         func()
+}
+
+// addRoutesLocked is the shared batch-add implementation. The caller must hold
+// m.mu.
+func (m *Manager) addRoutesLocked(ctx context.Context, cidrs []string, progress ProgressFunc, t routeTarget) (added int, errors int) {
 	cidrs = SummarizeCIDRs(cidrs)
 	if len(cidrs) == 0 {
-		m.saveAppliedRoutes()
+		t.save()
 		return 0, 0
 	}
 
@@ -476,12 +550,9 @@ func (m *Manager) AddRoutesContext(ctx context.Context, cidrs []string, progress
 
 	tasks := make([]routeTask, 0, len(cidrs))
 	for _, cidr := range cidrs {
-		gateway := m.gateway
+		gateway := t.gatewayFor(cidr)
 		family := routeFamily(cidr)
-		if family == 6 {
-			gateway = m.ipv6Gateway
-		}
-		if line, ok := netshAddLine(cidr, gateway, m.interfaceIndexFor(cidr)); ok {
+		if line, ok := netshAddLine(cidr, gateway, t.interfaceFor(cidr)); ok {
 			tasks = append(tasks, routeTask{cidr: cidr, line: line, family: family})
 		} else {
 			errors++
@@ -494,7 +565,7 @@ func (m *Manager) AddRoutesContext(ctx context.Context, cidrs []string, progress
 	for start := 0; start < len(tasks); start += netshBatchSize {
 		if err := ctx.Err(); err != nil {
 			log.Printf("Route add canceled after %d/%d routes: %v", done, total, err)
-			m.saveAppliedRoutes()
+			t.save()
 			return added, errors
 		}
 
@@ -507,23 +578,23 @@ func (m *Manager) AddRoutesContext(ctx context.Context, cidrs []string, progress
 		if err := runNetshScript(ctx, lines); err == nil {
 			for _, task := range chunk {
 				added++
-				m.trackRoute(task.cidr, task.family)
+				t.track(task.cidr, task.family)
 			}
 			done += len(chunk)
-			m.saveAppliedRoutes()
+			t.save()
 			reportProgress(progress, done, total)
 			continue
 		} else if ctx.Err() != nil {
 			log.Printf("Route add canceled after %d/%d routes: %v", done, total, ctx.Err())
-			m.saveAppliedRoutes()
+			t.save()
 			return added, errors
 		} else if isRouteAlreadyExistsError(err) {
 			for _, task := range chunk {
 				added++
-				m.trackRoute(task.cidr, task.family)
+				t.track(task.cidr, task.family)
 			}
 			done += len(chunk)
-			m.saveAppliedRoutes()
+			t.save()
 			reportProgress(progress, done, total)
 			continue
 		} else {
@@ -533,18 +604,18 @@ func (m *Manager) AddRoutesContext(ctx context.Context, cidrs []string, progress
 		for _, task := range chunk {
 			if err := ctx.Err(); err != nil {
 				log.Printf("Route add canceled after %d/%d routes: %v", done, total, err)
-				m.saveAppliedRoutes()
+				t.save()
 				return added, errors
 			}
 			if err := runNetshScript(ctx, []string{task.line}); err != nil {
 				if ctx.Err() != nil {
 					log.Printf("Route add canceled after %d/%d routes: %v", done, total, ctx.Err())
-					m.saveAppliedRoutes()
+					t.save()
 					return added, errors
 				}
 				if isRouteAlreadyExistsError(err) || m.isRoutePresent(task.cidr) {
 					added++
-					m.trackRoute(task.cidr, task.family)
+					t.track(task.cidr, task.family)
 					done++
 					reportProgress(progress, done, total)
 					continue
@@ -556,13 +627,13 @@ func (m *Manager) AddRoutesContext(ctx context.Context, cidrs []string, progress
 				continue
 			}
 			added++
-			m.trackRoute(task.cidr, task.family)
+			t.track(task.cidr, task.family)
 			done++
 			reportProgress(progress, done, total)
 		}
-		m.saveAppliedRoutes()
+		t.save()
 	}
-	m.saveAppliedRoutes()
+	t.save()
 	return added, errors
 }
 
@@ -574,6 +645,14 @@ func (m *Manager) RemoveAllRoutesContext(ctx context.Context, progress ProgressF
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	removed, errors = m.removeAllRoutesLocked(ctx, progress)
+	vpnRemoved, vpnErrors := m.removeAllVPNRoutesLocked(ctx, progress)
+	return removed + vpnRemoved, errors + vpnErrors
+}
+
+// removeAllRoutesLocked removes bypass routes (original gateway). The caller
+// must hold m.mu.
+func (m *Manager) removeAllRoutesLocked(ctx context.Context, progress ProgressFunc) (removed int, errors int) {
 	routes := append([]string(nil), m.appliedRoutes...)
 	total := len(routes)
 	done := 0
@@ -592,12 +671,27 @@ func (m *Manager) RemoveAllRoutesContext(ctx context.Context, progress ProgressF
 		}
 	}
 
+	removed, errors, remaining = m.removeRoutesBatchLocked(ctx, tasks, remaining, progress, &done, total)
+	m.replaceAppliedRoutes(remaining)
+	return removed, errors
+}
+
+// removeRoutesBatchLocked executes the batch deletion of route tasks. It does
+// not touch applied-route tracking; the caller persists the returned remaining
+// tasks. The caller must hold m.mu.
+func (m *Manager) removeRoutesBatchLocked(
+	ctx context.Context,
+	tasks []routeTask,
+	remaining []routeTask,
+	progress ProgressFunc,
+	done *int,
+	total int,
+) (removed int, errors int, finalRemaining []routeTask) {
 	for start := 0; start < len(tasks); start += netshBatchSize {
 		if err := ctx.Err(); err != nil {
-			log.Printf("Route cleanup canceled after %d/%d routes: %v", done, total, err)
+			log.Printf("Route cleanup canceled after %d/%d routes: %v", *done, total, err)
 			remaining = append(remaining, tasks[start:]...)
-			m.replaceAppliedRoutes(remaining)
-			return removed, errors
+			return removed, errors, remaining
 		}
 
 		end := start + netshBatchSize
@@ -608,18 +702,17 @@ func (m *Manager) RemoveAllRoutesContext(ctx context.Context, progress ProgressF
 		lines := routeTaskLines(chunk)
 		if err := runNetshScript(ctx, lines); err == nil {
 			removed += len(chunk)
-			done += len(chunk)
-			reportProgress(progress, done, total)
+			*done += len(chunk)
+			reportProgress(progress, *done, total)
 			continue
 		} else if ctx.Err() != nil {
-			log.Printf("Route cleanup canceled after %d/%d routes: %v", done, total, ctx.Err())
+			log.Printf("Route cleanup canceled after %d/%d routes: %v", *done, total, ctx.Err())
 			remaining = append(remaining, tasks[start:]...)
-			m.replaceAppliedRoutes(remaining)
-			return removed, errors
+			return removed, errors, remaining
 		} else if isRouteMissingError(err) {
 			removed += len(chunk)
-			done += len(chunk)
-			reportProgress(progress, done, total)
+			*done += len(chunk)
+			reportProgress(progress, *done, total)
 			continue
 		} else {
 			log.Printf("Route batch delete failed (%d-%d/%d), retrying individually: %v", start+1, end, len(tasks), err)
@@ -627,42 +720,39 @@ func (m *Manager) RemoveAllRoutesContext(ctx context.Context, progress ProgressF
 
 		for _, task := range chunk {
 			if err := ctx.Err(); err != nil {
-				log.Printf("Route cleanup canceled after %d/%d routes: %v", done, total, err)
+				log.Printf("Route cleanup canceled after %d/%d routes: %v", *done, total, err)
 				remaining = append(remaining, task)
 				remaining = append(remaining, chunkRoutesAfter(chunk, task.cidr)...)
 				remaining = append(remaining, tasks[end:]...)
-				m.replaceAppliedRoutes(remaining)
-				return removed, errors
+				return removed, errors, remaining
 			}
 			if err := runNetshScript(ctx, []string{task.line}); err != nil {
 				if ctx.Err() != nil {
-					log.Printf("Route cleanup canceled after %d/%d routes: %v", done, total, ctx.Err())
+					log.Printf("Route cleanup canceled after %d/%d routes: %v", *done, total, ctx.Err())
 					remaining = append(remaining, task)
 					remaining = append(remaining, chunkRoutesAfter(chunk, task.cidr)...)
 					remaining = append(remaining, tasks[end:]...)
-					m.replaceAppliedRoutes(remaining)
-					return removed, errors
+					return removed, errors, remaining
 				}
 				if isRouteMissingError(err) || !m.isRoutePresent(task.cidr) {
 					removed++
-					done++
-					reportProgress(progress, done, total)
+					*done++
+					reportProgress(progress, *done, total)
 					continue
 				}
 				errors++
 				remaining = append(remaining, task)
 				log.Printf("Failed to delete route %s: %v", task.cidr, err)
-				done++
-				reportProgress(progress, done, total)
+				*done++
+				reportProgress(progress, *done, total)
 				continue
 			}
 			removed++
-			done++
-			reportProgress(progress, done, total)
+			*done++
+			reportProgress(progress, *done, total)
 		}
 	}
-	m.replaceAppliedRoutes(remaining)
-	return removed, errors
+	return removed, errors, remaining
 }
 
 func reportProgress(progress ProgressFunc, done, total int) {
@@ -915,23 +1005,131 @@ func (m *Manager) loadAppliedRoutes() ([]string, bool) {
 	return routes, true
 }
 
+func (m *Manager) appliedVPNRoutesPath() string {
+	return filepath.Join(m.dataDir, "applied_vpn_routes.json")
+}
+
+// vpnGatewayFor returns the VPN gateway. VPN routes are IPv4-only in the
+// Cisco static domestic_direct path (IPv6 split defaults to off).
+func (m *Manager) vpnGatewayFor(cidr string) string {
+	return m.vpnGateway
+}
+
+func (m *Manager) vpnInterfaceIndexFor(cidr string) int {
+	return m.vpnInterfaceIndex
+}
+
+func (m *Manager) trackVPNRoute(cidr string, family int) {
+	if _, exists := m.appliedVPNRouteFamilies[cidr]; exists {
+		return
+	}
+	m.appliedVPNRoutes = append(m.appliedVPNRoutes, cidr)
+	m.appliedVPNRouteFamilies[cidr] = family
+}
+
+func (m *Manager) saveAppliedVPNRoutes() {
+	data, _ := json.Marshal(m.appliedVPNRoutes)
+	_ = os.MkdirAll(m.dataDir, 0755)
+	_ = os.WriteFile(m.appliedVPNRoutesPath(), data, 0644)
+}
+
+func (m *Manager) loadAppliedVPNRoutes() ([]string, bool) {
+	data, err := os.ReadFile(m.appliedVPNRoutesPath())
+	if err != nil {
+		return nil, false
+	}
+	var routes []string
+	if err := json.Unmarshal(data, &routes); err != nil {
+		return nil, false
+	}
+	return routes, true
+}
+
+// HasAppliedVPNRoutes reports whether VPN routes are currently applied.
+func (m *Manager) HasAppliedVPNRoutes() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.appliedVPNRoutes) > 0
+}
+
+// GetAppliedVPNRouteCount returns the number of currently applied VPN routes.
+func (m *Manager) GetAppliedVPNRouteCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.appliedVPNRoutes)
+}
+
+// RemoveAllVPNRoutesContext removes all VPN routes that were added via
+// AddVPNRoutesContext. The caller must not hold m.mu.
+func (m *Manager) RemoveAllVPNRoutesContext(ctx context.Context, progress ProgressFunc) (removed int, errors int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.removeAllVPNRoutesLocked(ctx, progress)
+}
+
+// removeAllVPNRoutesLocked removes VPN routes. The caller must hold m.mu.
+func (m *Manager) removeAllVPNRoutesLocked(ctx context.Context, progress ProgressFunc) (removed int, errors int) {
+	routes := append([]string(nil), m.appliedVPNRoutes...)
+	total := len(routes)
+	done := 0
+	reportProgress(progress, done, total)
+
+	tasks := make([]routeTask, 0, len(routes))
+	remaining := make([]routeTask, 0)
+	for _, cidr := range routes {
+		if line, ok := netshDeleteLine(cidr, m.vpnGateway, m.vpnInterfaceIndex); ok {
+			tasks = append(tasks, routeTask{cidr: cidr, line: line, family: routeFamily(cidr)})
+		} else {
+			errors++
+			remaining = append(remaining, routeTask{cidr: cidr, family: routeFamily(cidr)})
+			done++
+			reportProgress(progress, done, total)
+		}
+	}
+
+	removed, errors, remaining = m.removeRoutesBatchLocked(ctx, tasks, remaining, progress, &done, total)
+	m.replaceAppliedVPNRoutes(remaining)
+	return removed, errors
+}
+
+func (m *Manager) replaceAppliedVPNRoutes(tasks []routeTask) {
+	m.appliedVPNRoutes = nil
+	m.appliedVPNRouteFamilies = make(map[string]int, len(tasks))
+	for _, task := range tasks {
+		if _, exists := m.appliedVPNRouteFamilies[task.cidr]; exists {
+			continue
+		}
+		m.appliedVPNRoutes = append(m.appliedVPNRoutes, task.cidr)
+		m.appliedVPNRouteFamilies[task.cidr] = task.family
+	}
+	m.saveAppliedVPNRoutes()
+}
+
 func (m *Manager) CleanupStaleRoutes() {
 	stale, ok := m.loadAppliedRoutes()
-	if !ok {
-		return
+	if ok && len(stale) > 0 {
+		log.Printf("Cleaning up %d stale routes from previous session", len(stale))
+		m.mu.Lock()
+		m.appliedRoutes = stale
+		m.appliedRouteFamilies = make(map[string]int, len(stale))
+		for _, cidr := range stale {
+			m.appliedRouteFamilies[cidr] = routeFamily(cidr)
+		}
+		m.mu.Unlock()
+		m.RemoveAllRoutes()
 	}
-	if len(stale) == 0 {
-		return
+	staleVPN, ok := m.loadAppliedVPNRoutes()
+	if ok && len(staleVPN) > 0 {
+		log.Printf("Cleaning up %d stale VPN routes from previous session", len(staleVPN))
+		m.mu.Lock()
+		m.appliedVPNRoutes = staleVPN
+		m.appliedVPNRouteFamilies = make(map[string]int, len(staleVPN))
+		for _, cidr := range staleVPN {
+			m.appliedVPNRouteFamilies[cidr] = routeFamily(cidr)
+		}
+		m.mu.Unlock()
+		_, _ = m.RemoveAllVPNRoutesContext(context.Background(), nil)
 	}
-	log.Printf("Cleaning up %d stale routes from previous session", len(stale))
-	m.mu.Lock()
-	m.appliedRoutes = stale
-	m.appliedRouteFamilies = make(map[string]int, len(stale))
-	for _, cidr := range stale {
-		m.appliedRouteFamilies[cidr] = routeFamily(cidr)
-	}
-	m.mu.Unlock()
-	m.RemoveAllRoutes()
 }
 
 func (m *Manager) HasAppliedRoutes() bool {
@@ -946,14 +1144,19 @@ func (m *Manager) ForgetAppliedRoutes() {
 	m.appliedRoutes = nil
 	m.appliedRouteFamilies = make(map[string]int)
 	m.saveAppliedRoutes()
+	m.appliedVPNRoutes = nil
+	m.appliedVPNRouteFamilies = make(map[string]int)
+	m.saveAppliedVPNRoutes()
 }
 
 func (m *Manager) HasStaleRoutes() bool {
-	stale, ok := m.loadAppliedRoutes()
-	if !ok {
-		return false
+	if stale, ok := m.loadAppliedRoutes(); ok && len(stale) > 0 {
+		return true
 	}
-	return len(stale) > 0
+	if stale, ok := m.loadAppliedVPNRoutes(); ok && len(stale) > 0 {
+		return true
+	}
+	return false
 }
 
 func (m *Manager) SavedRoutesMatch(expected []string) bool {

@@ -146,6 +146,35 @@ func HasCiscoDefaultRoute() bool {
 	return err == nil && strings.TrimSpace(output) != ""
 }
 
+// GetVPNDefaultRoute detects the Cisco/AnyConnect VPN adapter's IPv4 default
+// route and returns its gateway (NextHop) and interface index. Used to push
+// foreign whitelist traffic through the VPN in domestic_direct mode.
+func GetVPNDefaultRoute() (DefaultRoute, error) {
+	script := `$routes = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue; foreach ($route in $routes) { $adapter = Get-NetAdapter -IncludeHidden -InterfaceIndex $route.InterfaceIndex -ErrorAction SilentlyContinue; if ($adapter -and ($adapter.InterfaceDescription -match 'Cisco|AnyConnect' -or $adapter.Name -match 'Cisco|AnyConnect')) { @{ InterfaceIndex = $route.InterfaceIndex; NextHop = $route.NextHop } | ConvertTo-Json -Compress; break } }`
+	output, err := runPowerShell(script, 8*time.Second)
+	if err != nil {
+		return DefaultRoute{}, fmt.Errorf("query VPN default route failed: %w", err)
+	}
+	output = strings.TrimSpace(output)
+	if output == "" {
+		return DefaultRoute{}, fmt.Errorf("no Cisco/AnyConnect VPN default route found")
+	}
+	var parsed struct {
+		InterfaceIndex int    `json:"InterfaceIndex"`
+		NextHop        string `json:"NextHop"`
+	}
+	if err := json.Unmarshal([]byte(output), &parsed); err != nil {
+		return DefaultRoute{}, fmt.Errorf("parse VPN default route: %w", err)
+	}
+	if parsed.InterfaceIndex <= 0 || parsed.NextHop == "" || parsed.NextHop == "0.0.0.0" {
+		return DefaultRoute{}, fmt.Errorf("VPN default route incomplete")
+	}
+	return DefaultRoute{
+		Gateway:        parsed.NextHop,
+		InterfaceIndex: parsed.InterfaceIndex,
+	}, nil
+}
+
 type Monitor struct {
 	mu                  sync.Mutex
 	state               VPNState
@@ -187,7 +216,7 @@ func NewWithStatusDetector(detect Detector) *Monitor {
 		stop:                make(chan struct{}),
 		interval:            5 * time.Second,
 		detect:              detect,
-		disconnectThreshold: 24,
+		disconnectThreshold: 1,
 	}
 }
 

@@ -82,3 +82,45 @@ func TestWizardStartsInstalledAppWithoutWaitingForLongRunningProcess(t *testing.
 		t.Fatal("wizardScript should start the installed app without waiting on the app process tree")
 	}
 }
+
+func TestWizardPreparesOverwriteBeforeCopyingPayload(t *testing.T) {
+	prepareIndex := strings.Index(wizardScript, "('--prepare-overwrite', $installDir)")
+	if prepareIndex < 0 {
+		t.Fatal("wizardScript should prepare overwrite installs before copying payload")
+	}
+	installIndex := strings.Index(wizardScript, "('--install-payload', $installDir)")
+	if installIndex < 0 {
+		t.Fatal("wizardScript should install payload")
+	}
+	if prepareIndex > installIndex {
+		t.Fatal("wizardScript should stop the existing app before overwriting files")
+	}
+}
+
+func TestPrepareOverwriteStopsAppTreeAndOrphanedDashboard(t *testing.T) {
+	script := prepareOverwriteScript(`C:\InstallDir\anyconnect-split.exe`)
+
+	for _, want := range []string{
+		"taskkill.exe",
+		"'/PID'",
+		"'/T'",
+		"'/F'",
+		"$dashboardStatePath = Join-Path $installDir 'data\\dashboard-state.json'",
+		"AnyConnect 分流管理台",
+		"Get-TargetDashboardProcesses",
+		"$stillDashboards.Count -gt 0",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("prepare overwrite script missing %q", want)
+		}
+	}
+}
+
+func TestWizardRecordsInstallDirectoryForFutureOverwrite(t *testing.T) {
+	if !strings.Contains(wizardScript, "('--write-install-state', $installDir)") {
+		t.Fatal("wizardScript should persist the install directory for future overwrite installs")
+	}
+	if installRegistryPath != `Software\AnyConnectSplitTunnel` {
+		t.Fatalf("installRegistryPath = %q, want stable product registry path", installRegistryPath)
+	}
+}

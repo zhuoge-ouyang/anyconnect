@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/user/anyconnect-split/internal/config"
 	"github.com/user/anyconnect-split/internal/monitor"
 )
 
@@ -40,6 +41,9 @@ type Options struct {
 	VPNInterfaceName    string
 	InterfaceName       string
 	DirectDomains       []string
+	ForeignDomains      []string
+	ForeignCIDRs        []string
+	SplitMode           string
 	SingBoxLogLevel     string
 }
 
@@ -109,6 +113,28 @@ func DetectExecutable(configured, exeName string) string {
 func (s *Session) ResolveTools() {
 	s.opts.OpenConnectPath = DetectExecutable(s.opts.OpenConnectPath, "openconnect.exe")
 	s.opts.SingBoxPath = DetectExecutable(s.opts.SingBoxPath, "sing-box.exe")
+}
+
+// SetForeignWhitelist updates the foreign domain/CIDR whitelist used in
+// domestic_direct mode. Takes effect on the next Refresh/Start.
+func (s *Session) SetForeignWhitelist(domains, cidrs []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.opts.ForeignDomains = domains
+	s.opts.ForeignCIDRs = cidrs
+}
+
+// SetSplitMode updates the mode used by the next Refresh or Start. Unsupported
+// values are rejected without changing the active session options.
+func (s *Session) SetSplitMode(mode string) bool {
+	normalized, ok := config.NormalizeSplitMode(mode)
+	if !ok {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.opts.SplitMode = normalized
+	return true
 }
 
 func (s *Session) ToolsAvailable() error {
@@ -230,10 +256,10 @@ func (s *Session) Presence() monitor.VPNPresence {
 		return monitor.PresenceConnected
 	}
 	if openConnectStarted || singBoxStarted {
-		if !openConnectAlive && !singBoxAlive {
-			return monitor.PresenceDisconnected
-		}
-		return monitor.PresenceUnknown
+		// A TUN session is only usable when both halves are alive. Treat a
+		// partial backend as disconnected so the monitor can clean up and
+		// reconnect instead of preserving a broken route indefinitely.
+		return monitor.PresenceDisconnected
 	}
 	return monitor.PresenceDisconnected
 }
@@ -309,6 +335,9 @@ func (s *Session) startSingBoxLocked(directCIDRs []string, protectedCIDRs []stri
 		DirectCIDRs:    directCIDRs,
 		ProtectedCIDRs: protectedCIDRs,
 		DirectDomains:  s.opts.DirectDomains,
+		ForeignDomains: s.opts.ForeignDomains,
+		ForeignCIDRs:   s.opts.ForeignCIDRs,
+		SplitMode:      s.opts.SplitMode,
 		LogLevel:       s.opts.SingBoxLogLevel,
 		SplitEnabled:   splitEnabled,
 	})
@@ -562,14 +591,31 @@ func (s *Session) resolveLocalInterfaceName() (string, error) {
 	if strings.TrimSpace(s.opts.LocalInterfaceName) != "" {
 		return strings.TrimSpace(s.opts.LocalInterfaceName), nil
 	}
-	if s.opts.LocalInterfaceIndex > 0 {
-		iface, err := net.InterfaceByIndex(s.opts.LocalInterfaceIndex)
-		if err == nil && iface != nil && strings.TrimSpace(iface.Name) != "" {
-			return iface.Name, nil
-		}
-		return "", fmt.Errorf("local interface index %d not found: %w", s.opts.LocalInterfaceIndex, err)
+
+	// Interface indexes are assigned by Windows and can change after a reboot,
+	// adapter reset, or network reconnect. Always resolve the current default
+	// route at connection time instead of trusting the persisted index.
+	current, err := monitor.GetDefaultRoute()
+	if err != nil {
+		return "", fmt.Errorf("resolve current local default route: %w", err)
 	}
-	return "", fmt.Errorf("missing local interface for TUN direct outbound")
+	if current.InterfaceIndex <= 0 {
+		return "", fmt.Errorf("resolve current local default route: interface index is invalid")
+	}
+	iface, err := net.InterfaceByIndex(current.InterfaceIndex)
+	if err != nil || iface == nil || strings.TrimSpace(iface.Name) == "" {
+		if err == nil {
+			err = fmt.Errorf("interface is unavailable")
+		}
+		return "", fmt.Errorf("resolve current local interface index %d: %w", current.InterfaceIndex, err)
+	}
+	if s.opts.LocalInterfaceIndex != current.InterfaceIndex || s.opts.LocalGateway != current.Gateway {
+		log.Printf("Refreshed local default route for TUN: gateway=%s interface_index=%d (previous gateway=%s interface_index=%d)",
+			current.Gateway, current.InterfaceIndex, s.opts.LocalGateway, s.opts.LocalInterfaceIndex)
+	}
+	s.opts.LocalGateway = current.Gateway
+	s.opts.LocalInterfaceIndex = current.InterfaceIndex
+	return iface.Name, nil
 }
 
 func (s *Session) detectVPNInterfaceName(localName string) (string, error) {
@@ -744,8 +790,17 @@ type ConfigOptions struct {
 	DirectCIDRs    []string
 	ProtectedCIDRs []string
 	DirectDomains  []string
+	ForeignDomains []string
+	ForeignCIDRs   []string
+	SplitMode      string
 	LogLevel       string
 	SplitEnabled   bool
+}
+
+// isDomesticDirect reports whether the split mode defaults traffic to direct
+// (only foreign whitelist goes through VPN).
+func (o ConfigOptions) isDomesticDirect() bool {
+	return strings.EqualFold(strings.TrimSpace(o.SplitMode), "domestic_direct")
 }
 
 func normalizeSingBoxLogLevel(level string) string {
@@ -785,7 +840,29 @@ func BuildSingBoxConfig(opts ConfigOptions) ([]byte, error) {
 			"outbound": "direct-local",
 		})
 	}
-	if opts.SplitEnabled {
+
+	domesticDirect := opts.isDomesticDirect()
+	finalOutbound := "vpn-direct"
+	dnsFinal := "dns-vpn"
+
+	if domesticDirect && opts.SplitEnabled {
+		// 默认全部直连：仅国外白名单走 VPN。
+		finalOutbound = "direct-local"
+		dnsFinal = "dns-local"
+		if len(opts.ForeignCIDRs) > 0 {
+			rules = append(rules, map[string]any{
+				"ip_cidr":  uniqueStrings(opts.ForeignCIDRs),
+				"outbound": "vpn-direct",
+			})
+		}
+		if len(opts.ForeignDomains) > 0 {
+			rules = append(rules, map[string]any{
+				"domain_suffix": uniqueStrings(opts.ForeignDomains),
+				"outbound":      "vpn-direct",
+			})
+		}
+	} else if opts.SplitEnabled {
+		// 默认全部走 VPN：仅国内白名单直连。
 		if len(opts.DirectCIDRs) > 0 {
 			rules = append(rules, map[string]any{
 				"ip_cidr":  uniqueStrings(opts.DirectCIDRs),
@@ -820,11 +897,30 @@ func BuildSingBoxConfig(opts ConfigOptions) ([]byte, error) {
 	}
 	dnsConfig := map[string]any{
 		"servers":  dnsServers,
-		"final":    "dns-vpn",
+		"final":    dnsFinal,
 		"strategy": "prefer_ipv4",
 	}
-	// In split mode, route domestic domains to local DNS
-	if opts.SplitEnabled && len(opts.DirectDomains) > 0 {
+	// Build DNS routing rules based on the active split mode.
+	if domesticDirect && opts.SplitEnabled {
+		if len(opts.ForeignDomains) > 0 {
+			suffixes := make([]string, 0, len(opts.ForeignDomains))
+			for _, d := range uniqueStrings(opts.ForeignDomains) {
+				d = strings.TrimPrefix(d, ".")
+				if d != "" {
+					suffixes = append(suffixes, d)
+				}
+			}
+			if len(suffixes) > 0 {
+				dnsConfig["rules"] = []map[string]any{
+					{
+						"domain_suffix": suffixes,
+						"server":        "dns-vpn",
+					},
+				}
+			}
+		}
+	} else if opts.SplitEnabled && len(opts.DirectDomains) > 0 {
+		// In foreign_direct split mode, route domestic domains to local DNS
 		suffixes := make([]string, 0, len(opts.DirectDomains))
 		for _, d := range uniqueStrings(opts.DirectDomains) {
 			d = strings.TrimPrefix(d, ".")
@@ -875,7 +971,7 @@ func BuildSingBoxConfig(opts ConfigOptions) ([]byte, error) {
 		"route": map[string]any{
 			"auto_detect_interface": true,
 			"rules":                 rules,
-			"final":                 "vpn-direct",
+			"final":                 finalOutbound,
 		},
 	}
 	return json.MarshalIndent(config, "", "  ")

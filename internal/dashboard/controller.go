@@ -7,16 +7,24 @@ import (
 )
 
 type Actions struct {
-	OnDisconnect      func()
-	OnReconnect       func()
-	OnCodexMode       func()
-	OnRestoreNormal   func()
-	OnToggleSplit     func(enabled bool)
-	OnUpdateIPDB      func()
-	OnViewLog         func()
-	OnToggleAutoStart func(enabled bool)
-	OnContactAuthor   func()
-	OnQuit            func()
+	OnDisconnect          func()
+	OnReconnect           func()
+	OnCodexMode           func()
+	OnRestoreNormal       func()
+	OnSetSplitMode        func(mode string)
+	OnUpdateIPDB          func()
+	OnAddForeignDomain    func(value string)
+	OnAddForeignCIDR      func(value string)
+	OnRemoveForeignDomain func(value string)
+	OnRemoveForeignCIDR   func(value string)
+	OnSmartContinue       func()
+	OnSmartCancel         func()
+	OnSmartAccept         func()
+	OnSmartRestore        func()
+	OnViewLog             func()
+	OnToggleAutoStart     func(enabled bool)
+	OnContactAuthor       func()
+	OnQuit                func()
 }
 
 type Controller struct {
@@ -76,13 +84,45 @@ func (c *Controller) dispatch(command Command) {
 		if c.actions.OnRestoreNormal != nil {
 			c.actions.OnRestoreNormal()
 		}
-	case ActionToggleSplit:
-		if c.actions.OnToggleSplit != nil && command.Enabled != nil {
-			c.actions.OnToggleSplit(*command.Enabled)
+	case ActionSetSplitMode:
+		if c.actions.OnSetSplitMode != nil && command.Value != nil {
+			c.actions.OnSetSplitMode(*command.Value)
 		}
 	case ActionUpdateIPDB:
 		if c.actions.OnUpdateIPDB != nil {
 			c.actions.OnUpdateIPDB()
+		}
+	case ActionAddForeignDomain:
+		if c.actions.OnAddForeignDomain != nil && command.Value != nil {
+			c.actions.OnAddForeignDomain(*command.Value)
+		}
+	case ActionAddForeignCIDR:
+		if c.actions.OnAddForeignCIDR != nil && command.Value != nil {
+			c.actions.OnAddForeignCIDR(*command.Value)
+		}
+	case ActionRemoveForeignDomain:
+		if c.actions.OnRemoveForeignDomain != nil && command.Value != nil {
+			c.actions.OnRemoveForeignDomain(*command.Value)
+		}
+	case ActionRemoveForeignCIDR:
+		if c.actions.OnRemoveForeignCIDR != nil && command.Value != nil {
+			c.actions.OnRemoveForeignCIDR(*command.Value)
+		}
+	case ActionSmartContinue:
+		if c.actions.OnSmartContinue != nil {
+			c.actions.OnSmartContinue()
+		}
+	case ActionSmartCancel:
+		if c.actions.OnSmartCancel != nil {
+			c.actions.OnSmartCancel()
+		}
+	case ActionSmartAccept:
+		if c.actions.OnSmartAccept != nil {
+			c.actions.OnSmartAccept()
+		}
+	case ActionSmartRestore:
+		if c.actions.OnSmartRestore != nil {
+			c.actions.OnSmartRestore()
 		}
 	case ActionViewLog:
 		if c.actions.OnViewLog != nil {

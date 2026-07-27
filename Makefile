@@ -7,6 +7,7 @@ icons:
 
 build: icons
 	go build -ldflags="-s -w" -o bin/anyconnect-split.exe ./cmd/
+	powershell -NoProfile -Command "New-Item -ItemType Directory -Force -Path 'bin\\ui-assets' | Out-Null; Copy-Item -Force 'internal\\ui\\assets\\desktop-login-bg.png' 'bin\\ui-assets\\desktop-login-bg.png'; Copy-Item -Force 'internal\\ui\\assets\\desktop-dashboard-bg.png' 'bin\\ui-assets\\desktop-dashboard-bg.png'; Copy-Item -Force 'internal\\ui\\assets\\wechat-contact-qr.png' 'bin\\ui-assets\\wechat-contact-qr.png'"
 
 run:
 	go run ./cmd/

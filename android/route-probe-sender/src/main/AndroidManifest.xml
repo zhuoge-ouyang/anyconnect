@@ -1,0 +1,30 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="com.msitools.anyconnectmobile.routeprobe.permission.SEND_HELPER_PROBE" />
+
+    <application
+        android:allowBackup="false"
+        android:label="@string/app_name"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <activity
+            android:name=".HelperWarmupActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:finishOnTaskLaunch="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.NoDisplay" />
+        <provider
+            android:name=".ExternalProbeProvider"
+            android:authorities="com.msitools.anyconnectmobile.routeprobesender.probe"
+            android:exported="true"
+            android:permission="com.msitools.anyconnectmobile.routeprobe.permission.SEND_HELPER_PROBE" />
+        <receiver
+            android:name=".ExternalProbeReceiver"
+            android:exported="true"
+            android:permission="com.msitools.anyconnectmobile.routeprobe.permission.SEND_HELPER_PROBE">
+            <intent-filter>
+                <action android:name="com.msitools.anyconnectmobile.routeprobesender.SEND_UDP_PROBE" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

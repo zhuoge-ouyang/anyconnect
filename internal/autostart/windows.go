@@ -39,6 +39,17 @@ func runHidden(name string, args ...string) error {
 	return cmd.Run()
 }
 
+func taskSettingsCommand() string {
+	return `$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Seconds 0); Set-ScheduledTask -TaskName 'AnyConnectSplitTunnel' -Settings $settings | Out-Null`
+}
+
+func configureTaskSettings() error {
+	if err := runHidden("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", taskSettingsCommand()); err != nil {
+		return fmt.Errorf("configure startup task settings: %w", err)
+	}
+	return nil
+}
+
 func removeLegacyRunValue() {
 	k, err := registry.OpenKey(registry.CURRENT_USER, runKeyPath, registry.SET_VALUE)
 	if err != nil {
@@ -69,6 +80,9 @@ func Enable() error {
 	if err := runHidden("schtasks", args...); err != nil {
 		return fmt.Errorf("create startup task: %w", err)
 	}
+	if err := configureTaskSettings(); err != nil {
+		return err
+	}
 	removeLegacyRunValue()
 	return nil
 }
@@ -86,4 +100,19 @@ func Disable() error {
 
 func IsEnabled() bool {
 	return runHidden("schtasks", "/Query", "/TN", taskName) == nil
+}
+
+func reconcileTask(isEnabled func() bool, refresh func() error) (bool, error) {
+	if !isEnabled() {
+		return false, nil
+	}
+	return true, refresh()
+}
+
+// Reconcile refreshes an existing login task so its action always points to
+// the currently running executable. This repairs stale task targets left by an
+// executable rename or an application upgrade without enabling autostart for
+// users who have disabled it.
+func Reconcile() (bool, error) {
+	return reconcileTask(IsEnabled, Enable)
 }

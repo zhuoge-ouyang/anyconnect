@@ -3,13 +3,35 @@ package main
 import (
 	"errors"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/windows"
 
 	"github.com/user/anyconnect-split/internal/config"
 	"github.com/user/anyconnect-split/internal/monitor"
 	"github.com/user/anyconnect-split/internal/tun"
 )
+
+func TestRunTrayLoopKeepsCallbackOnOneOSThread(t *testing.T) {
+	threadIDs := make([]uint32, 0, 32)
+	runTrayLoop(func() {
+		for range 32 {
+			threadIDs = append(threadIDs, windows.GetCurrentThreadId())
+			runtime.Gosched()
+		}
+	})
+
+	if len(threadIDs) == 0 {
+		t.Fatal("tray runner callback was not invoked")
+	}
+	for _, threadID := range threadIDs[1:] {
+		if threadID != threadIDs[0] {
+			t.Fatalf("tray runner moved from OS thread %d to %d", threadIDs[0], threadID)
+		}
+	}
+}
 
 func TestShouldRefreshAfterIPDBUpdateSkipsInactiveTun(t *testing.T) {
 	if shouldRefreshAfterIPDBUpdate(true, monitor.StateActive, true, false) {

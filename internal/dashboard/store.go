@@ -9,30 +9,42 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/user/anyconnect-split/internal/config"
 )
 
 type Action string
 
 const (
-	ActionDisconnect      Action = "disconnect"
-	ActionReconnect       Action = "reconnect"
-	ActionCodexMode       Action = "codex_mode"
-	ActionRestoreNormal   Action = "restore_normal"
-	ActionToggleSplit     Action = "toggle_split"
-	ActionUpdateIPDB      Action = "update_ipdb"
-	ActionViewLog         Action = "view_log"
-	ActionToggleAutoStart Action = "toggle_autostart"
-	ActionContactAuthor   Action = "contact_author"
-	ActionQuit            Action = "quit"
+	ActionDisconnect          Action = "disconnect"
+	ActionReconnect           Action = "reconnect"
+	ActionCodexMode           Action = "codex_mode"
+	ActionRestoreNormal       Action = "restore_normal"
+	ActionSetSplitMode        Action = "set_split_mode"
+	ActionUpdateIPDB          Action = "update_ipdb"
+	ActionAddForeignDomain    Action = "add_foreign_domain"
+	ActionAddForeignCIDR      Action = "add_foreign_cidr"
+	ActionRemoveForeignDomain Action = "remove_foreign_domain"
+	ActionRemoveForeignCIDR   Action = "remove_foreign_cidr"
+	ActionSmartContinue       Action = "smart_select_continue"
+	ActionSmartCancel         Action = "smart_select_cancel"
+	ActionSmartAccept         Action = "smart_select_accept"
+	ActionSmartRestore        Action = "smart_select_restore"
+	ActionViewLog             Action = "view_log"
+	ActionToggleAutoStart     Action = "toggle_autostart"
+	ActionContactAuthor       Action = "contact_author"
+	ActionQuit                Action = "quit"
 )
 
 type Snapshot struct {
 	StatusText          string    `json:"status_text"`
 	CurrentSite         string    `json:"current_site"`
 	SplitTunnelEnabled  bool      `json:"split_tunnel_enabled"`
+	SplitMode           string    `json:"split_mode"`
 	AutoStartEnabled    bool      `json:"auto_start_enabled"`
 	Backend             string    `json:"backend"`
 	RouteCount          int       `json:"route_count"`
+	CodexModeActive     bool      `json:"codex_mode_active"`
 	LastIPDBUpdate      time.Time `json:"last_ipdb_update"`
 	OriginalGateway     string    `json:"original_gateway"`
 	OriginalInterface   int       `json:"original_interface"`
@@ -40,12 +52,26 @@ type Snapshot struct {
 	OriginalIPv6IfIndex int       `json:"original_ipv6_interface_index"`
 	IPv6SplitEnabled    bool      `json:"ipv6_split_enabled"`
 	LastError           string    `json:"last_error"`
+	ForeignDomains      []string  `json:"foreign_domains"`
+	ForeignCIDRs        []string  `json:"foreign_cidrs"`
+	SmartState          string    `json:"smart_state"`
+	SmartMessage        string    `json:"smart_message"`
+	SmartResultID       string    `json:"smart_result_id"`
+	SmartCandidate      string    `json:"smart_candidate"`
+	SmartAttempts       int       `json:"smart_attempts"`
+	SmartSuccesses      int       `json:"smart_successes"`
+	SmartMedianMS       int64     `json:"smart_median_ms"`
+	SmartSlowestMS      int64     `json:"smart_slowest_ms"`
+	SmartExitIP         string    `json:"smart_exit_ip"`
+	SmartExitRegion     string    `json:"smart_exit_region"`
+	SmartDeadline       time.Time `json:"smart_deadline"`
 	UpdatedAt           time.Time `json:"updated_at"`
 }
 
 type Command struct {
 	Action    Action    `json:"action"`
 	Enabled   *bool     `json:"enabled,omitempty"`
+	Value     *string   `json:"value,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -151,11 +177,25 @@ func (s *Store) ConsumeCommands() ([]Command, error) {
 func (c Command) Validate() error {
 	switch c.Action {
 	case ActionDisconnect, ActionReconnect, ActionCodexMode, ActionRestoreNormal,
+		ActionSmartContinue, ActionSmartCancel, ActionSmartAccept, ActionSmartRestore,
 		ActionUpdateIPDB, ActionViewLog, ActionContactAuthor, ActionQuit:
 		return nil
-	case ActionToggleSplit, ActionToggleAutoStart:
+	case ActionToggleAutoStart:
 		if c.Enabled == nil {
 			return fmt.Errorf("%s command requires enabled value", c.Action)
+		}
+		return nil
+	case ActionSetSplitMode:
+		if c.Value == nil {
+			return fmt.Errorf("%s command requires value", c.Action)
+		}
+		if _, ok := config.NormalizeSplitMode(*c.Value); !ok {
+			return fmt.Errorf("%s command has unsupported value %q", c.Action, *c.Value)
+		}
+		return nil
+	case ActionAddForeignDomain, ActionAddForeignCIDR, ActionRemoveForeignDomain, ActionRemoveForeignCIDR:
+		if c.Value == nil || strings.TrimSpace(*c.Value) == "" {
+			return fmt.Errorf("%s command requires value", c.Action)
 		}
 		return nil
 	default:

@@ -46,7 +46,7 @@ PowerShell -ExecutionPolicy Bypass -File tools\package.ps1
 
 ## 目录导览
 
-- `cmd/main.go`: 主程序入口；管理员提权、单实例、托盘启动、连接编排、路由刷新、Codex 稳定线路切换。
+- `cmd/main.go`: 主程序入口；管理员提权、单实例、托盘启动、连接编排、路由刷新、ChatGPT/Codex 智能选线。
 - `cmd/installer/main.go`: Windows 安装器；释放 payload、创建快捷方式、检测/安装 Cisco 客户端、启动主程序。
 - `internal/config`: 配置结构、默认值、配置归一化、Cisco `vpncli.exe` 自动探测。
 - `internal/vpn`: Cisco `vpncli.exe` 连接、断开、状态检测和冲突进程清理。

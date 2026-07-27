@@ -1,0 +1,25 @@
+<resources>
+    <string name="app_name">AnyConnect 分流</string>
+    <string name="title">AnyConnect 分流客户端</string>
+    <string name="subtitle">让小精灵帮你守住网络小路</string>
+    <string name="site_label">节点</string>
+    <string name="site_hint">选择一条云上小路</string>
+    <string name="username_hint">用户名</string>
+    <string name="password_hint">密码</string>
+    <string name="connect">开启森林隧道</string>
+    <string name="disconnect">收起森林隧道</string>
+    <string name="vpn_permission_denied">VPN 授权被取消。</string>
+    <string name="notification_title">AnyConnect 分流</string>
+    <string name="notification_connecting">正在连接 VPN…</string>
+    <string name="notification_connected">VPN 已连接。</string>
+    <string name="status_disconnected">VPN 已断开。</string>
+    <string name="initial_status">请选择节点并输入账号密码。</string>
+    <string name="contact_link">联系作者</string>
+    <string name="contact_title">绿泡泡联系</string>
+    <string name="contact_scan_hint">微信扫码添加作者</string>
+    <string name="contact_value">ai_creater99</string>
+    <string name="copy_contact">复制微信号</string>
+    <string name="contact_copied">已复制：ai_creater99</string>
+    <string name="close">关闭</string>
+    <string name="splash_loading">正在唤醒森林网络小精灵…</string>
+</resources>

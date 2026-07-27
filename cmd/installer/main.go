@@ -18,11 +18,14 @@ import (
 	"github.com/user/anyconnect-split/internal/config"
 	"github.com/user/anyconnect-split/internal/ipdb"
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 )
 
 const (
-	installFolder  = "AnyConnectSplitTunnel"
-	hideWindowFlag = 0x08000000
+	installFolder       = "AnyConnectSplitTunnel"
+	installRegistryPath = `Software\AnyConnectSplitTunnel`
+	appExeName          = "anyconnect-split.exe"
+	hideWindowFlag      = 0x08000000
 )
 
 const (
@@ -64,6 +67,11 @@ func handleCommand(args []string) bool {
 		if err == nil {
 			err = installPayload(args[1])
 		}
+	case "--prepare-overwrite":
+		err = requireArg(args, 2, "missing install directory")
+		if err == nil {
+			err = prepareOverwriteInstall(args[1])
+		}
 	case "--extract-cisco":
 		err = requireArg(args, 2, "missing output directory")
 		if err == nil {
@@ -84,13 +92,18 @@ func handleCommand(args []string) bool {
 		err = requireArg(args, 2, "missing install directory")
 		if err == nil {
 			installDir := args[1]
-			err = createShortcuts(filepath.Join(installDir, "anyconnect-split.exe"), installDir)
+			err = createShortcuts(filepath.Join(installDir, appExeName), installDir)
 		}
 	case "--start-app":
 		err = requireArg(args, 2, "missing install directory")
 		if err == nil {
 			installDir := args[1]
-			err = startApp(filepath.Join(installDir, "anyconnect-split.exe"), installDir)
+			err = startApp(filepath.Join(installDir, appExeName), installDir)
+		}
+	case "--write-install-state":
+		err = requireArg(args, 2, "missing install directory")
+		if err == nil {
+			err = writeInstallState(args[1])
 		}
 	default:
 		return false
@@ -187,6 +200,9 @@ func relaunchElevated() {
 }
 
 func defaultInstallDir() string {
+	if dir := installedDirFromRegistry(); dir != "" {
+		return dir
+	}
 	base := os.Getenv("ProgramFiles")
 	if base == "" {
 		base = os.Getenv("ProgramFiles(x86)")
@@ -195,6 +211,53 @@ func defaultInstallDir() string {
 		base = filepath.Join(os.Getenv("SystemDrive")+`\`, "Program Files")
 	}
 	return filepath.Join(base, installFolder)
+}
+
+func installedDirFromRegistry() string {
+	for _, access := range []uint32{
+		registry.QUERY_VALUE | registry.WOW64_64KEY,
+		registry.QUERY_VALUE,
+	} {
+		key, err := registry.OpenKey(registry.LOCAL_MACHINE, installRegistryPath, access)
+		if err != nil {
+			continue
+		}
+		value, _, err := key.GetStringValue("InstallDir")
+		_ = key.Close()
+		if err != nil {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		return filepath.Clean(value)
+	}
+	return ""
+}
+
+func writeInstallState(installDir string) error {
+	key, _, err := registry.CreateKey(
+		registry.LOCAL_MACHINE,
+		installRegistryPath,
+		registry.SET_VALUE|registry.WOW64_64KEY,
+	)
+	if err != nil {
+		return err
+	}
+	defer key.Close()
+
+	installDir = filepath.Clean(installDir)
+	if err := key.SetStringValue("InstallDir", installDir); err != nil {
+		return err
+	}
+	if err := key.SetStringValue("DisplayName", shortcutDescription); err != nil {
+		return err
+	}
+	if err := key.SetStringValue("ExecutablePath", filepath.Join(installDir, appExeName)); err != nil {
+		return err
+	}
+	return key.SetStringValue("ShortcutName", shortcutName)
 }
 
 func installPayload(installDir string) error {
@@ -227,6 +290,68 @@ func installPayload(installDir string) error {
 		}
 		return os.WriteFile(dst, data, 0644)
 	})
+}
+
+func prepareOverwriteInstall(installDir string) error {
+	appPath := filepath.Clean(filepath.Join(installDir, appExeName))
+	script := prepareOverwriteScript(appPath)
+
+	cmd := exec.Command("powershell", "-NoProfile", "-Command", script)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: hideWindowFlag}
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func prepareOverwriteScript(appPath string) string {
+	return fmt.Sprintf(`
+$ErrorActionPreference = 'Stop'
+$target = [System.IO.Path]::GetFullPath(%s)
+$installDir = [System.IO.Path]::GetDirectoryName($target)
+$dashboardStatePath = Join-Path $installDir 'data\dashboard-state.json'
+
+function Get-TargetAppProcesses {
+    return @(Get-CimInstance Win32_Process -Filter "Name = 'anyconnect-split.exe'" -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.ExecutablePath -and
+            ([System.IO.Path]::GetFullPath($_.ExecutablePath) -ieq $target)
+        })
+}
+
+function Get-TargetDashboardProcesses {
+    return @(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object {
+            $commandLine = [string]$_.CommandLine
+            (-not [string]::IsNullOrWhiteSpace($commandLine)) -and
+            ($commandLine.IndexOf($dashboardStatePath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -and
+            ($commandLine.IndexOf('AnyConnect 分流管理台', [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+        })
+}
+
+$deadline = (Get-Date).AddSeconds(8)
+do {
+    $matches = Get-TargetAppProcesses
+    foreach ($p in $matches) {
+        Start-Process -FilePath 'taskkill.exe' -ArgumentList @('/PID', [string]$p.ProcessId, '/T', '/F') -Wait -WindowStyle Hidden | Out-Null
+    }
+
+    $dashboards = Get-TargetDashboardProcesses
+    foreach ($p in $dashboards) {
+        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+
+    if ($matches.Count -eq 0 -and $dashboards.Count -eq 0) { break }
+    Start-Sleep -Milliseconds 250
+} while ((Get-Date) -lt $deadline)
+
+$stillRunning = Get-TargetAppProcesses
+$stillDashboards = Get-TargetDashboardProcesses
+if ($stillRunning.Count -gt 0 -or $stillDashboards.Count -gt 0) {
+    throw '旧版本仍在运行，无法覆盖安装。请先退出分流守卫后重试。'
+}
+`, psQuote(appPath))
 }
 
 func shouldSkipPayload(rel string) bool {
@@ -478,7 +603,7 @@ $form.Controls.Add($title)
 $subtitle = New-Object System.Windows.Forms.Label
 $subtitle.Location = New-Object System.Drawing.Point(28, 62)
 $subtitle.Size = New-Object System.Drawing.Size(540, 42)
-$subtitle.Text = '选择安装位置。安装包已内置 OpenConnect、sing-box 和 IP 库，通常不需要额外安装其他软件。'
+$subtitle.Text = '选择安装位置。再次安装会覆盖旧版本，不会创建新的安装副本；安装包已内置 OpenConnect、sing-box 和 IP 库。'
 $subtitle.ForeColor = [System.Drawing.Color]::FromArgb(71, 85, 105)
 $form.Controls.Add($subtitle)
 
@@ -563,7 +688,10 @@ function Set-InstallControlsEnabled($enabled) {
 }
 
 function Invoke-InstallSteps($installDir) {
-    Set-InstallProgress 8 '正在准备安装目录...'
+    Set-InstallProgress 5 '正在关闭旧版本并准备覆盖安装...'
+    Invoke-InstallerCommand -Arguments @('--prepare-overwrite', $installDir) -FailureMessage '旧版本仍在运行，无法覆盖安装。请先退出分流守卫后重试。'
+
+    Set-InstallProgress 10 '正在准备安装目录并覆盖程序文件...'
     Invoke-InstallerCommand -Arguments @('--install-payload', $installDir) -FailureMessage '安装主程序失败。'
 
     Set-InstallProgress 35 '主程序安装完成，正在检查内置连接组件...'
@@ -605,6 +733,8 @@ function Invoke-InstallSteps($installDir) {
 
     Set-InstallProgress 82 '正在创建桌面和开始菜单快捷方式...'
     Invoke-InstallerCommand -Arguments @('--create-shortcuts', $installDir) -FailureMessage '创建快捷方式失败。'
+    Set-InstallProgress 88 '正在记录安装位置，后续更新将继续覆盖这里...'
+    Invoke-InstallerCommand -Arguments @('--write-install-state', $installDir) -FailureMessage '记录安装位置失败。'
     Set-InstallProgress 94 '正在启动程序...'
     Start-InstalledApp $installDir
     Set-InstallProgress 100 '安装完成，登录窗口稍后会打开。请使用你自己的 VPN 账号密码登录。'

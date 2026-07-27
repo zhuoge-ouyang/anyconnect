@@ -53,6 +53,17 @@ func TestMonitorDisconnectedDetectionCanCleanActiveRoutes(t *testing.T) {
 	}
 }
 
+func TestMonitorDefaultDisconnectDetectionCleansImmediately(t *testing.T) {
+	m := NewWithStatusDetector(nil)
+	m.state = StateActive
+
+	m.handleDetection(PresenceDisconnected)
+
+	if got := m.State(); got != StateCleaning {
+		t.Fatalf("state after definitive disconnect = %s, want %s", got, StateCleaning)
+	}
+}
+
 func TestHasCiscoDefaultRouteInNetshOutput(t *testing.T) {
 	output := `
 Publish  Type      Met  Prefix                    Idx  Gateway/Interface Name

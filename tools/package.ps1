@@ -33,6 +33,7 @@ function Copy-RequiredPayload {
     $appIcon = Join-Path $root "internal\tray\app.ico"
     Copy-Item -LiteralPath $appIcon -Destination (Join-Path $payloadDir "app.ico") -Force
     Copy-Item -LiteralPath $appIcon -Destination (Join-Path $payloadDir "app-shortcut.ico") -Force
+    Copy-UiAssets
     Copy-Item -LiteralPath (Join-Path $root "configs\config.dist.yaml") -Destination (Join-Path $payloadDir "configs\config.yaml") -Force
 
     Copy-IpDatabaseSeed
@@ -107,6 +108,23 @@ function Copy-RequiredPayload {
     }
 }
 
+function Copy-UiAssets {
+    Copy-UiAssetsToDir -TargetDir (Join-Path $payloadDir "ui-assets")
+}
+
+function Copy-UiAssetsToDir {
+    param([Parameter(Mandatory=$true)][string]$TargetDir)
+
+    $source = Join-Path $root "internal\ui\assets"
+    if (!(Test-Path -LiteralPath $source)) {
+        throw "UI assets directory is missing: $source"
+    }
+    New-Item -ItemType Directory -Force -Path $TargetDir | Out-Null
+    Copy-Item -LiteralPath (Join-Path $source "desktop-login-bg.png") -Destination (Join-Path $TargetDir "desktop-login-bg.png") -Force
+    Copy-Item -LiteralPath (Join-Path $source "desktop-dashboard-bg.png") -Destination (Join-Path $TargetDir "desktop-dashboard-bg.png") -Force
+    Copy-Item -LiteralPath (Join-Path $source "wechat-contact-qr.png") -Destination (Join-Path $TargetDir "wechat-contact-qr.png") -Force
+}
+
 function Assert-FileExists {
     param(
         [Parameter(Mandatory=$true)][string]$Path,
@@ -135,6 +153,9 @@ function Assert-SelfContainedPayload {
     Assert-FileExists -Path (Join-Path $payloadDir "anyconnect-split.exe") -Message "Payload is missing the main application."
     Assert-FileExists -Path (Join-Path $payloadDir "configs\config.yaml") -Message "Payload is missing config.yaml."
     Assert-FileExists -Path (Join-Path $payloadDir "data\china_ip_list.txt") -Message "Payload is missing the China IP database."
+    Assert-FileExists -Path (Join-Path $payloadDir "ui-assets\desktop-login-bg.png") -Message "Payload is missing the desktop login background."
+    Assert-FileExists -Path (Join-Path $payloadDir "ui-assets\desktop-dashboard-bg.png") -Message "Payload is missing the desktop dashboard background."
+    Assert-FileExists -Path (Join-Path $payloadDir "ui-assets\wechat-contact-qr.png") -Message "Payload is missing the contact QR code."
 
     if ($AllowMissingBundledTools) {
         return
@@ -205,6 +226,7 @@ try {
     Pop-Location
 
     go build -ldflags "-s -w" -o $appExe ./cmd/
+    Copy-UiAssetsToDir -TargetDir (Join-Path $binDir "ui-assets")
 
     Clear-Payload
     Copy-RequiredPayload

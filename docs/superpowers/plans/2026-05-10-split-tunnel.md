@@ -97,7 +97,7 @@ Create `Makefile`:
 .PHONY: build run clean test
 
 build:
-	go build -ldflags="-H windowsgui" -o bin/split-tunnel.exe ./cmd/
+	go build -ldflags="-H windowsgui" -o bin/anyconnect-split.exe ./cmd/
 
 run:
 	go run ./cmd/
@@ -1475,10 +1475,10 @@ go mod tidy
 
 ```bash
 cd d:\project\anyconnect
-go build -ldflags="-H windowsgui" -o bin/split-tunnel.exe ./cmd/
+go build -ldflags="-H windowsgui" -o bin/anyconnect-split.exe ./cmd/
 ```
 
-Expected: Compiles successfully, produces `bin/split-tunnel.exe`.
+Expected: Compiles successfully, produces `bin/anyconnect-split.exe`.
 
 - [ ] **Step 4: Commit**
 
@@ -1504,14 +1504,14 @@ Expected: All tests pass.
 
 ```bash
 cd d:\project\anyconnect
-go build -ldflags="-H windowsgui -s -w" -o bin/split-tunnel.exe ./cmd/
+go build -ldflags="-H windowsgui -s -w" -o bin/anyconnect-split.exe ./cmd/
 ```
 
 The `-s -w` flags strip debug info for smaller binary.
 
 - [ ] **Step 3: Manual test - run as administrator**
 
-1. Right-click `bin/split-tunnel.exe` → Run as administrator
+1. Right-click `bin/anyconnect-split.exe` → Run as administrator
 2. Verify system tray icon appears (gray)
 3. Right-click tray icon, verify menu items are present
 4. Check `split-tunnel.log` file is created with startup messages
