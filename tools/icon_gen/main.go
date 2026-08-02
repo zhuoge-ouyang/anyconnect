@@ -17,7 +17,8 @@ import (
 
 const (
 	outFile             = `internal/tray/icon_data.go`
-	srcFile             = `internal/tray/vpn_icon.png`
+	trayPreviewFile     = `internal/tray/vpn_icon.png`
+	brandIconSourceFile = `internal/tray/bridge_icon_source.png`
 	icoFile             = `internal/tray/app.ico`
 	cmdIconICOFile      = `cmd/winres/icon.ico`
 	cmdIconPNGFile      = `cmd/winres/icon.png`
@@ -48,11 +49,15 @@ func main() {
 	activeICO := activeFrames[0]
 	busyICO := busyFrames[0]
 	errorICO := trayIconICO(modeError, 0, 1)
-	appICO := appIconICO()
+	brandIcon, err := loadPNG(brandIconSourceFile)
+	if err != nil {
+		exitf("Failed to load brand icon %s: %v", brandIconSourceFile, err)
+	}
+	appICO := appIconICO(brandIcon)
 
-	sourceIcon := renderIcon(256, modeActive, 1, 6)
-	if err := writePNG(srcFile, sourceIcon); err != nil {
-		exitf("Failed to write source PNG: %v", err)
+	trayPreview := renderIcon(256, modeActive, 1, 6)
+	if err := writePNG(trayPreviewFile, trayPreview); err != nil {
+		exitf("Failed to write tray preview PNG: %v", err)
 	}
 	if err := writeFile(icoFile, appICO); err != nil {
 		exitf("Failed to write app ICO: %v", err)
@@ -62,12 +67,13 @@ func main() {
 			exitf("Failed to write %s: %v", path, err)
 		}
 	}
+	sourceIcon := renderBrandIcon(brandIcon, 256)
 	for _, path := range []string{cmdIconPNGFile, installerPNGFile} {
 		if err := writePNG(path, sourceIcon); err != nil {
 			exitf("Failed to write %s: %v", path, err)
 		}
 	}
-	smallIcon := renderIcon(32, modeActive, 1, 6)
+	smallIcon := renderBrandIcon(brandIcon, 32)
 	for _, path := range []string{cmdIconSmallPNGFile, installerSmallFile} {
 		if err := writePNG(path, smallIcon); err != nil {
 			exitf("Failed to write %s: %v", path, err)
@@ -83,7 +89,7 @@ func main() {
 	fmt.Fprintln(out, "package tray")
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "// 自动生成的图标数据，请勿手动编辑")
-	fmt.Fprintln(out, "// 源图片: vpn_icon.png")
+	fmt.Fprintln(out, "// 托盘状态图标由 tools/icon_gen 生成；应用品牌图标通过 app_icon.go 嵌入。")
 	fmt.Fprintln(out)
 	writeVar(out, "iconIdle", idleICO)
 	fmt.Fprintln(out)
@@ -96,8 +102,6 @@ func main() {
 	writeVarList(out, "iconActiveFrames", activeFrames)
 	fmt.Fprintln(out)
 	writeVarList(out, "iconBusyFrames", busyFrames)
-	fmt.Fprintln(out)
-	writeVar(out, "AppIcon", appICO)
 
 	fmt.Println("icon_data.go generated successfully.")
 }
@@ -121,11 +125,11 @@ func trayIconICO(mode visualMode, frame, frameCount int) []byte {
 	return toICO(images)
 }
 
-func appIconICO() []byte {
+func appIconICO(source image.Image) []byte {
 	images := make([]sizedImage, 0, len(appSizes))
 	for _, size := range appSizes {
 		var buf bytes.Buffer
-		if err := png.Encode(&buf, renderIcon(size, modeActive, 1, 6)); err != nil {
+		if err := png.Encode(&buf, renderBrandIcon(source, size)); err != nil {
 			exitf("Failed to encode %dpx app icon: %v", size, err)
 		}
 		images = append(images, sizedImage{size: size, data: buf.Bytes()})
@@ -143,6 +147,30 @@ func renderIcon(size int, mode visualMode, frame, frameCount int) *image.RGBA {
 	dst := image.NewRGBA(image.Rect(0, 0, size, size))
 	xdraw.CatmullRom.Scale(dst, dst.Bounds(), img, img.Bounds(), stdDraw.Over, nil)
 	return dst
+}
+
+func renderBrandIcon(source image.Image, size int) *image.RGBA {
+	dst := image.NewRGBA(image.Rect(0, 0, size, size))
+	xdraw.CatmullRom.Scale(dst, dst.Bounds(), source, source.Bounds(), stdDraw.Src, nil)
+	applyRoundedAlpha(dst, float64(size)*0.13)
+	return dst
+}
+
+func applyRoundedAlpha(img *image.RGBA, radius float64) {
+	width := img.Bounds().Dx()
+	height := img.Bounds().Dy()
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			nx := math.Max(radius, math.Min(float64(x)+0.5, float64(width)-radius))
+			ny := math.Max(radius, math.Min(float64(y)+0.5, float64(height)-radius))
+			dx := float64(x) + 0.5 - nx
+			dy := float64(y) + 0.5 - ny
+			if dx*dx+dy*dy > radius*radius {
+				offset := img.PixOffset(x, y)
+				img.Pix[offset+3] = 0
+			}
+		}
+	}
 }
 
 func drawIconSymbol(img *image.RGBA, s float64, mode visualMode, frame, frameCount int) {
@@ -424,6 +452,15 @@ func writePNG(path string, img image.Image) error {
 	}
 	defer f.Close()
 	return png.Encode(f, img)
+}
+
+func loadPNG(path string) (image.Image, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return png.Decode(f)
 }
 
 func writeFile(path string, data []byte) error {

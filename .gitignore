@@ -9,6 +9,7 @@ bin/
 .tmp-openconnect/
 artifacts/android-auto-runs/
 artifacts/backups/
+artifacts/package-staging/
 artifacts/*.json
 artifacts/*.log
 artifacts/*.xml

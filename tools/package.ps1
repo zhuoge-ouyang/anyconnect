@@ -1,6 +1,7 @@
 param(
     [string]$CiscoInstallerPath = "",
     [string]$OutputDir = "",
+    [string]$BuildDir = "",
     [switch]$KeepPayload,
     [switch]$AllowMissingBundledTools
 )
@@ -9,10 +10,17 @@ $ErrorActionPreference = "Stop"
 
 $root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $payloadDir = Join-Path $root "cmd\installer\payload"
-$binDir = Join-Path $root "bin"
-$appExe = Join-Path $binDir "anyconnect-split.exe"
+$runtimeBinDir = Join-Path $root "bin"
+if ($BuildDir -eq "") {
+    $BuildDir = $runtimeBinDir
+} elseif (![System.IO.Path]::IsPathRooted($BuildDir)) {
+    $BuildDir = Join-Path $root $BuildDir
+}
+$appExe = Join-Path $BuildDir "anyconnect-split.exe"
 if ($OutputDir -eq "") {
     $OutputDir = Join-Path $root "artifacts"
+} elseif (![System.IO.Path]::IsPathRooted($OutputDir)) {
+    $OutputDir = Join-Path $root $OutputDir
 }
 $setupExe = Join-Path $OutputDir "AnyConnectSplitTunnelSetup.exe"
 
@@ -188,7 +196,8 @@ function Copy-IpDatabaseSeed {
     $payloadList = Join-Path $payloadDir "data\china_ip_list.txt"
     $candidateLists = @(
         (Join-Path $root "data\china_ip_list.txt"),
-        (Join-Path $binDir "data\china_ip_list.txt")
+        (Join-Path $runtimeBinDir "data\china_ip_list.txt"),
+        (Join-Path $BuildDir "data\china_ip_list.txt")
     )
 
     foreach ($candidate in $candidateLists) {
@@ -200,7 +209,7 @@ function Copy-IpDatabaseSeed {
     }
 
     Write-Host "No valid local IP database found. Downloading APNIC seed..."
-    $seedDir = Join-Path $binDir "data"
+    $seedDir = Join-Path $BuildDir "data"
     go run ./tools/ipdb_seed -out $seedDir
     $seedList = Join-Path $seedDir "china_ip_list.txt"
     if (!(Test-IpListFile -Path $seedList)) {
@@ -212,7 +221,7 @@ function Copy-IpDatabaseSeed {
 
 Push-Location $root
 try {
-    New-Item -ItemType Directory -Path $binDir -Force | Out-Null
+    New-Item -ItemType Directory -Path $BuildDir -Force | Out-Null
     New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
     go run ./tools/icon_gen
@@ -226,7 +235,7 @@ try {
     Pop-Location
 
     go build -ldflags "-s -w" -o $appExe ./cmd/
-    Copy-UiAssetsToDir -TargetDir (Join-Path $binDir "ui-assets")
+    Copy-UiAssetsToDir -TargetDir (Join-Path $BuildDir "ui-assets")
 
     Clear-Payload
     Copy-RequiredPayload

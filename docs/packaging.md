@@ -12,6 +12,16 @@ PowerShell -ExecutionPolicy Bypass -File tools\package.ps1
 artifacts\AnyConnectSplitTunnelSetup.exe
 ```
 
+## 保持正在运行的分流守卫
+
+如果当前正在使用分流守卫，指定独立构建目录，避免打包覆盖被运行进程占用的 `bin` 文件：
+
+```powershell
+PowerShell -ExecutionPolicy Bypass -File tools\package.ps1 -BuildDir artifacts\package-staging
+```
+
+这个模式只在 `artifacts\package-staging` 生成待打包主程序和 UI 资源，不会退出、重启或替换当前 `bin` 中正在运行的分流守卫。
+
 ## 打包 Cisco 客户端
 
 默认安装包会内置 OpenConnect、sing-box、wintun.dll 和 `data\china_ip_list.txt`，朋友电脑安装后通常不需要额外安装 Cisco 客户端。
