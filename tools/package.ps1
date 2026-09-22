@@ -2,11 +2,24 @@ param(
     [string]$CiscoInstallerPath = "",
     [string]$OutputDir = "",
     [string]$BuildDir = "",
+    [string]$Version = "1.0.4.0",
+    [string]$Publisher = "",
+    [ValidateSet('Unsigned', 'Authenticode')][string]$SigningMode = 'Unsigned',
+    [string]$CertificateThumbprint = "",
+    [ValidateSet('CurrentUser', 'LocalMachine')][string]$CertificateStore = 'CurrentUser',
+    [string]$SignToolPath = "",
+    [string]$TimestampUrl = "",
     [switch]$KeepPayload,
     [switch]$AllowMissingBundledTools
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot 'release-support.ps1')
+Assert-ReleaseVersion $Version
+# Validate before building or clearing payload. No unsigned fallback on signing failure.
+$signing = New-ReleaseSigningSettings -Mode $SigningMode -Publisher $Publisher `
+    -CertificateThumbprint $CertificateThumbprint -CertificateStore $CertificateStore `
+    -SignToolPath $SignToolPath -TimestampUrl $TimestampUrl
 
 $root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $payloadDir = Join-Path $root "cmd\installer\payload"
@@ -23,6 +36,7 @@ if ($OutputDir -eq "") {
     $OutputDir = Join-Path $root $OutputDir
 }
 $setupExe = Join-Path $OutputDir "AnyConnectSplitTunnelSetup.exe"
+$setupCandidate = Join-Path $BuildDir 'AnyConnectSplitTunnelSetup.pending.exe'
 
 function Clear-Payload {
     if (!(Test-Path $payloadDir)) {
@@ -38,6 +52,7 @@ function Copy-RequiredPayload {
     New-Item -ItemType Directory -Path (Join-Path $payloadDir "data") -Force | Out-Null
 
     Copy-Item -LiteralPath $appExe -Destination (Join-Path $payloadDir "anyconnect-split.exe") -Force
+    Copy-Item -LiteralPath (Join-Path $BuildDir 'anyconnect-ui.exe') -Destination (Join-Path $payloadDir 'anyconnect-ui.exe') -Force
     $appIcon = Join-Path $root "internal\tray\app.ico"
     Copy-Item -LiteralPath $appIcon -Destination (Join-Path $payloadDir "app.ico") -Force
     Copy-Item -LiteralPath $appIcon -Destination (Join-Path $payloadDir "app-shortcut.ico") -Force
@@ -130,6 +145,8 @@ function Copy-UiAssetsToDir {
     New-Item -ItemType Directory -Force -Path $TargetDir | Out-Null
     Copy-Item -LiteralPath (Join-Path $source "desktop-login-bg.png") -Destination (Join-Path $TargetDir "desktop-login-bg.png") -Force
     Copy-Item -LiteralPath (Join-Path $source "desktop-dashboard-bg.png") -Destination (Join-Path $TargetDir "desktop-dashboard-bg.png") -Force
+    Copy-Item -LiteralPath (Join-Path $source "desktop-dashboard-sidebar.png") -Destination (Join-Path $TargetDir "desktop-dashboard-sidebar.png") -Force
+    Copy-Item -LiteralPath (Join-Path $root "cmd\winres\icon.png") -Destination (Join-Path $TargetDir "app-brand.png") -Force
     Copy-Item -LiteralPath (Join-Path $source "wechat-contact-qr.png") -Destination (Join-Path $TargetDir "wechat-contact-qr.png") -Force
 }
 
@@ -159,10 +176,13 @@ function Assert-MinFileSize {
 
 function Assert-SelfContainedPayload {
     Assert-FileExists -Path (Join-Path $payloadDir "anyconnect-split.exe") -Message "Payload is missing the main application."
+    Assert-FileExists -Path (Join-Path $payloadDir 'anyconnect-ui.exe') -Message 'Payload is missing the native UI host.'
     Assert-FileExists -Path (Join-Path $payloadDir "configs\config.yaml") -Message "Payload is missing config.yaml."
     Assert-FileExists -Path (Join-Path $payloadDir "data\china_ip_list.txt") -Message "Payload is missing the China IP database."
     Assert-FileExists -Path (Join-Path $payloadDir "ui-assets\desktop-login-bg.png") -Message "Payload is missing the desktop login background."
     Assert-FileExists -Path (Join-Path $payloadDir "ui-assets\desktop-dashboard-bg.png") -Message "Payload is missing the desktop dashboard background."
+    Assert-FileExists -Path (Join-Path $payloadDir "ui-assets\desktop-dashboard-sidebar.png") -Message "Payload is missing the desktop sidebar background."
+    Assert-FileExists -Path (Join-Path $payloadDir "ui-assets\app-brand.png") -Message "Payload is missing the application brand image."
     Assert-FileExists -Path (Join-Path $payloadDir "ui-assets\wechat-contact-qr.png") -Message "Payload is missing the contact QR code."
 
     if ($AllowMissingBundledTools) {
@@ -210,7 +230,7 @@ function Copy-IpDatabaseSeed {
 
     Write-Host "No valid local IP database found. Downloading APNIC seed..."
     $seedDir = Join-Path $BuildDir "data"
-    go run ./tools/ipdb_seed -out $seedDir
+    Invoke-ReleaseCommand go @('run', './tools/ipdb_seed', '-out', $seedDir)
     $seedList = Join-Path $seedDir "china_ip_list.txt"
     if (!(Test-IpListFile -Path $seedList)) {
         throw "Failed to prepare a valid IP database seed."
@@ -224,23 +244,62 @@ try {
     New-Item -ItemType Directory -Path $BuildDir -Force | Out-Null
     New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
-    go run ./tools/icon_gen
+    Invoke-ReleaseCommand go @('run', './tools/icon_gen')
 
     # Generate Windows resource files (.syso) with embedded icon
-    Push-Location (Join-Path $root "cmd")
-    go-winres make
-    Pop-Location
-    Push-Location (Join-Path $root "cmd\installer")
-    go-winres make
-    Pop-Location
+    foreach ($target in @('cmd', 'cmd\installer')) {
+        $targetDir = Join-Path $root $target
+        $resourcePath = Join-Path $BuildDir (($target.Replace('\', '-')) + '-winres.json')
+        New-ReleaseResource -Source (Join-Path $targetDir 'winres\winres.json') `
+            -Destination $resourcePath -Version $Version -Publisher $Publisher
+        Invoke-ReleaseCommand go-winres @('make', '--in', $resourcePath, '--out', (Join-Path $targetDir 'rsrc'))
+    }
 
-    go build -ldflags "-s -w" -o $appExe ./cmd/
+    Invoke-ReleaseCommand go @('build', '-trimpath', '-ldflags', '-s -w', '-o', $appExe, './cmd/')
+    Invoke-ReleaseSigning -Path $appExe -Settings $signing
+    & (Join-Path $PSScriptRoot 'build-ui-host.ps1') -OutputPath (Join-Path $BuildDir 'anyconnect-ui.exe') -Version $Version -Publisher $Publisher
+    Invoke-ReleaseSigning -Path (Join-Path $BuildDir 'anyconnect-ui.exe') -Settings $signing
     Copy-UiAssetsToDir -TargetDir (Join-Path $BuildDir "ui-assets")
 
     Clear-Payload
     Copy-RequiredPayload
 
-    go build -ldflags "-s -w -H=windowsgui" -o $setupExe ./cmd/installer
+    # Compile an immutable ownership list into the standalone uninstaller.
+    # Never trust a user-editable JSON manifest for elevated file deletion.
+    $ownedFiles = @(Get-ChildItem -LiteralPath $payloadDir -Recurse -File |
+        Where-Object { $_.Name -notin @('.gitignore', 'README.txt') } |
+        ForEach-Object { $_.FullName.Substring($payloadDir.Length + 1).Replace('\', '/') } |
+        Where-Object { -not $_.StartsWith('cisco/') } | Sort-Object)
+    $ownedJson = ConvertTo-Json -InputObject $ownedFiles -Compress
+    $ownedBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($ownedJson))
+    $uninstallResource = Join-Path $BuildDir 'uninstaller-winres.json'
+    New-ReleaseResource -Source (Join-Path $root 'cmd\installer\winres\winres.json') `
+        -Destination $uninstallResource -Version $Version -Publisher $Publisher
+    $resource = Get-Content -LiteralPath $uninstallResource -Raw | ConvertFrom-Json
+    $resource.RT_MANIFEST.'#1'.'0409'.identity.name = 'AnyConnect.SplitTunnel.Uninstall'
+    $resource.RT_MANIFEST.'#1'.'0409'.description = 'AnyConnect Split Tunnel Uninstaller'
+    $resource.RT_VERSION.'#1'.'0000'.info.'0409'.FileDescription = 'AnyConnect Split Tunnel Uninstaller'
+    $resource.RT_VERSION.'#1'.'0000'.info.'0409'.InternalName = 'uninstall'
+    $resource.RT_VERSION.'#1'.'0000'.info.'0409'.OriginalFilename = 'uninstall.exe'
+    [IO.File]::WriteAllText($uninstallResource, ($resource | ConvertTo-Json -Depth 20), (New-Object Text.UTF8Encoding($false)))
+    Invoke-ReleaseCommand go-winres @('make', '--in', $uninstallResource, '--out', (Join-Path $root 'cmd\uninstaller\rsrc'))
+    $uninstallerExe = Join-Path $payloadDir 'uninstall.exe'
+    Invoke-ReleaseCommand go @('build', '-trimpath', '-ldflags', "-s -w -H=windowsgui -X main.ownedFilesBase64=$ownedBase64", '-o', $uninstallerExe, './cmd/uninstaller')
+    Invoke-ReleaseSigning -Path $uninstallerExe -Settings $signing
+    $manifestPath = Join-Path $BuildDir 'payload-manifest.json'
+    Write-ReleaseManifest -PayloadDir $payloadDir -Destination $manifestPath -Version $Version -SigningMode $SigningMode
+
+    # Base64 carries publisher names with spaces/quotes safely through the Go linker.
+    $publisherBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Publisher))
+    Invoke-ReleaseCommand go @('build', '-trimpath', '-ldflags', "-s -w -H=windowsgui -X main.releaseVersion=$Version -X main.releasePublisherBase64=$publisherBase64", '-o', $setupCandidate, './cmd/installer')
+    Invoke-ReleaseSigning -Path $setupCandidate -Settings $signing
+    Copy-Item -LiteralPath $setupCandidate -Destination $setupExe -Force
+    $publishedManifest = Join-Path $OutputDir 'payload-manifest.json'
+    if ([IO.Path]::GetFullPath($manifestPath) -ne [IO.Path]::GetFullPath($publishedManifest)) {
+        Copy-Item -LiteralPath $manifestPath -Destination $publishedManifest -Force
+    }
+    $checksum = (Get-FileHash -LiteralPath $setupExe -Algorithm SHA256).Hash + '  ' + [IO.Path]::GetFileName($setupExe)
+    [IO.File]::WriteAllText(($setupExe + '.sha256'), ($checksum + [Environment]::NewLine), (New-Object Text.UTF8Encoding($false)))
 
     Write-Host "Installer created: $setupExe"
     if ($CiscoInstallerPath -eq "") {

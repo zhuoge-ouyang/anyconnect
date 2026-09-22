@@ -10,8 +10,8 @@ func TestDefaultConfigIncludesVPNSites(t *testing.T) {
 	if len(cfg.VPNSites) == 0 {
 		t.Fatal("DefaultConfig() has no VPN sites")
 	}
-	if cfg.PreferredSite != DefaultGlobalPreferredSite {
-		t.Fatalf("DefaultConfig().PreferredSite = %q, want global site", cfg.PreferredSite)
+	if cfg.PreferredSite != DefaultPreferredSite {
+		t.Fatalf("DefaultConfig().PreferredSite = %q, want Shenzhen site", cfg.PreferredSite)
 	}
 	if cfg.IPv6SplitEnabled {
 		t.Fatal("DefaultConfig().IPv6SplitEnabled = true, want false")
@@ -37,8 +37,8 @@ func TestNormalizeRepairsInvalidPreferredSite(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.PreferredSite = string([]byte{0xb9, 0xfa, 0xc4, 0xda})
 	cfg.normalize()
-	if cfg.PreferredSite != DefaultGlobalPreferredSite {
-		t.Fatalf("normalize() PreferredSite = %q, want global site", cfg.PreferredSite)
+	if cfg.PreferredSite != DefaultPreferredSite {
+		t.Fatalf("normalize() PreferredSite = %q, want Shenzhen site", cfg.PreferredSite)
 	}
 }
 
@@ -225,6 +225,15 @@ func TestDefaultConfigUsesDomesticDirectMode(t *testing.T) {
 	}
 	if len(cfg.ForeignDomains) == 0 {
 		t.Fatal("DefaultConfig().ForeignDomains is empty")
+	}
+	foreignSet := make(map[string]struct{}, len(cfg.ForeignDomains))
+	for _, domain := range cfg.ForeignDomains {
+		foreignSet[domain] = struct{}{}
+	}
+	for _, want := range []string{"huggingface.co", "hf.co"} {
+		if _, ok := foreignSet[want]; !ok {
+			t.Fatalf("DefaultConfig().ForeignDomains missing %q", want)
+		}
 	}
 	if cfg.RouteEntryLimit != DefaultRouteEntryLimit {
 		t.Fatalf("DefaultConfig().RouteEntryLimit = %d, want %d", cfg.RouteEntryLimit, DefaultRouteEntryLimit)

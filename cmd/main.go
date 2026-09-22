@@ -414,7 +414,9 @@ func connectionInput(cfg *config.Config, sites []ui.Site, allowAuto bool) (ui.Si
 		cfg.SavedUsername = ""
 		_ = credential.Delete(credentialTarget)
 	}
-	cfg.Save()
+	if err := cfg.Save(); err != nil {
+		log.Printf("Failed to save selected preferred site: %v", err)
+	}
 
 	return ui.Site{Name: result.SiteName, Server: result.Server}, result.Username, result.Password, true
 }

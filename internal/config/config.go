@@ -12,6 +12,7 @@ import (
 )
 
 const (
+	DefaultPreferredSite       = "03.国内专线-深圳节点"
 	DefaultGlobalPreferredSite = "23.澳大利亚"
 	TrafficBackendAuto         = "auto"
 	TrafficBackendOpenTun      = "openconnect_tun"
@@ -73,7 +74,7 @@ func DefaultConfig() *Config {
 		IPv6SplitEnabled:    false,
 		AutoStart:           false,
 		AutoConnect:         false,
-		PreferredSite:       DefaultGlobalPreferredSite,
+		PreferredSite:       DefaultPreferredSite,
 		CodexAutoSelect:     true,
 		CodexPreferredSite:  DefaultGlobalPreferredSite,
 		CodexProbeAttempts:  2,
@@ -353,6 +354,9 @@ func defaultForeignDomains() []string {
 		// GitLab
 		"gitlab.com",
 		"gitlab-static.net",
+		// Hugging Face model downloads and storage/CDN redirects
+		"huggingface.co",
+		"hf.co",
 	}
 }
 
@@ -517,7 +521,7 @@ func (c *Config) normalizeWith(hasSplitMode bool) {
 
 func defaultPreferredSite(sites []VPNSite) string {
 	for _, site := range sites {
-		if site.Name == DefaultGlobalPreferredSite {
+		if site.Name == DefaultPreferredSite {
 			return site.Name
 		}
 	}
@@ -531,7 +535,7 @@ func defaultPreferredSite(sites []VPNSite) string {
 	if len(sites) > 0 {
 		return sites[0].Name
 	}
-	return DefaultGlobalPreferredSite
+	return DefaultPreferredSite
 }
 
 func isLegacyDefaultDomesticDomains(domains []string) bool {

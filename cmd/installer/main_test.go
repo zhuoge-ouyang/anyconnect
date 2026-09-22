@@ -65,35 +65,28 @@ func TestHasBundledTunToolsRequiresOpenConnectAndSingBox(t *testing.T) {
 	}
 }
 
-func TestWizardSkipsCiscoWhenBundledTunToolsArePresent(t *testing.T) {
-	if !strings.Contains(wizardScript, "--has-bundled-tun-tools") {
-		t.Fatal("wizardScript does not check bundled TUN tools before requiring Cisco")
+func TestNativeWizardPreservesInstallSequence(t *testing.T) {
+	data, err := os.ReadFile("../../native/ui-host/Installer.cs")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(wizardScript, "(-not $hasBundledTun) -and (-not $hasCisco)") {
-		t.Fatal("wizardScript should only install Cisco when bundled TUN tools and Cisco are both unavailable")
+	source := string(data)
+	for _, want := range []string{"--has-bundled-tun-tools", "if(bundled!=0)", "--has-cisco", "--extract-cisco", "--write-install-state", "Process.Start(new ProcessStartInfo(Path.Combine(dir,", "anyconnect-split.exe"} {
+		if !strings.Contains(source, want) {
+			t.Fatalf("missing %q", want)
+		}
+	}
+	if strings.Index(source, "--prepare-overwrite") > strings.Index(source, "--install-payload") {
+		t.Fatal("wrong installation ordering")
+	}
+	if strings.Contains(source, "powershell") {
+		t.Fatal("wizard still launches PowerShell")
 	}
 }
 
-func TestWizardStartsInstalledAppWithoutWaitingForLongRunningProcess(t *testing.T) {
-	if strings.Contains(wizardScript, "Invoke-InstallerCommand -Arguments @('--start-app', $installDir)") {
-		t.Fatal("wizardScript waits on --start-app, which can block until the installed app exits")
-	}
-	if !strings.Contains(wizardScript, "Start-InstalledApp $installDir") {
-		t.Fatal("wizardScript should start the installed app without waiting on the app process tree")
-	}
-}
-
-func TestWizardPreparesOverwriteBeforeCopyingPayload(t *testing.T) {
-	prepareIndex := strings.Index(wizardScript, "('--prepare-overwrite', $installDir)")
-	if prepareIndex < 0 {
-		t.Fatal("wizardScript should prepare overwrite installs before copying payload")
-	}
-	installIndex := strings.Index(wizardScript, "('--install-payload', $installDir)")
-	if installIndex < 0 {
-		t.Fatal("wizardScript should install payload")
-	}
-	if prepareIndex > installIndex {
-		t.Fatal("wizardScript should stop the existing app before overwriting files")
+func TestNativeRuntimePresentOnValidationMachine(t *testing.T) {
+	if err := requireNativeUIRuntime(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -113,14 +106,5 @@ func TestPrepareOverwriteStopsAppTreeAndOrphanedDashboard(t *testing.T) {
 		if !strings.Contains(script, want) {
 			t.Fatalf("prepare overwrite script missing %q", want)
 		}
-	}
-}
-
-func TestWizardRecordsInstallDirectoryForFutureOverwrite(t *testing.T) {
-	if !strings.Contains(wizardScript, "('--write-install-state', $installDir)") {
-		t.Fatal("wizardScript should persist the install directory for future overwrite installs")
-	}
-	if installRegistryPath != `Software\AnyConnectSplitTunnel` {
-		t.Fatalf("installRegistryPath = %q, want stable product registry path", installRegistryPath)
 	}
 }

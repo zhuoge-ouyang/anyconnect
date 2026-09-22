@@ -11,7 +11,7 @@ sing_box_path: ""
 ipv6_split_enabled: false
 auto_start: false
 auto_connect: false
-preferred_site: "23.澳大利亚"
+preferred_site: "03.国内专线-深圳节点"
 saved_username: ""
 
 codex_auto_select: true
@@ -210,6 +210,9 @@ foreign_domain_exceptions:
   # GitLab
   - "gitlab.com"
   - "gitlab-static.net"
+  # Hugging Face 模型下载及存储/CDN 重定向
+  - "huggingface.co"
+  - "hf.co"
 
 # 国内直连模式下走 VPN 的国外 IP/CIDR 白名单（可选，留空即可）。
 # 例如：- "1.2.3.0/24"

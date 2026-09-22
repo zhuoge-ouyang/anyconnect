@@ -44,8 +44,8 @@ func TestDistConfigParsesWithNewFields(t *testing.T) {
 	if cfg.RouteEntryLimit != DefaultRouteEntryLimit {
 		t.Fatalf("dist RouteEntryLimit = %d, want %d", cfg.RouteEntryLimit, DefaultRouteEntryLimit)
 	}
-	// Codex/GitHub/Claude must be present.
-	want := []string{"openai.com", "chatgpt.com", "github.com", "gitlab.com", "anthropic.com", "claude.ai", "gemini.google.com"}
+	// Codex/GitHub/Claude/Hugging Face must be present.
+	want := []string{"openai.com", "chatgpt.com", "github.com", "gitlab.com", "anthropic.com", "claude.ai", "gemini.google.com", "huggingface.co", "hf.co"}
 	set := map[string]struct{}{}
 	for _, d := range cfg.ForeignDomains {
 		set[d] = struct{}{}
