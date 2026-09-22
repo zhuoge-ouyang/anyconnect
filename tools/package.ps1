@@ -2,7 +2,7 @@ param(
     [string]$CiscoInstallerPath = "",
     [string]$OutputDir = "",
     [string]$BuildDir = "",
-    [string]$Version = "1.0.4.0",
+    [string]$Version = "1.0.5.0",
     [string]$Publisher = "",
     [ValidateSet('Unsigned', 'Authenticode')][string]$SigningMode = 'Unsigned',
     [string]$CertificateThumbprint = "",

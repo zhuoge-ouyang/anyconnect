@@ -118,6 +118,12 @@ func (t *Tray) SetStatusListener(listener func(Status)) {
 	}
 }
 
+func (t *Tray) Snapshot() Status {
+	t.statusMu.RLock()
+	defer t.statusMu.RUnlock()
+	return t.status
+}
+
 func (t *Tray) SetStatusFields(text string, routeCount int, lastError string) {
 	t.statusMu.Lock()
 	t.status.StatusText = text

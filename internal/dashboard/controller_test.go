@@ -99,3 +99,31 @@ func TestControllerDispatchesSplitModeCommand(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+func TestControllerSelectSite(t *testing.T) {
+	store := NewStore(t.TempDir())
+	got := ""
+	c := NewController(store, Actions{OnSelectSite: func(name string) { got = name }})
+	for _, value := range []*string{nil, strPtr(" ")} {
+		if err := store.WriteCommand(Command{Action: ActionSelectSite, Value: value}); err == nil {
+			t.Fatal("empty site accepted")
+		}
+	}
+	name := "深圳 | 节点;一"
+	if err := store.WriteCommand(Command{Action: ActionSelectSite, Value: &name}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ProcessPendingCommands(); err != nil {
+		t.Fatal(err)
+	}
+	if got != name {
+		t.Fatal(got)
+	}
+	if err := c.UpdateSnapshot(Snapshot{Sites: []string{name}, ConnectionBusy: true}); err != nil {
+		t.Fatal(err)
+	}
+	s, err := c.ReadSnapshot()
+	if err != nil || !s.ConnectionBusy || len(s.Sites) != 1 || s.Sites[0] != name {
+		t.Fatalf("%+v %v", s, err)
+	}
+}

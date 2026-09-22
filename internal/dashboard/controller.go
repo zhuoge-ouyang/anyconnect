@@ -9,6 +9,7 @@ import (
 type Actions struct {
 	OnDisconnect          func()
 	OnReconnect           func()
+	OnSelectSite          func(name string)
 	OnCodexMode           func()
 	OnRestoreNormal       func()
 	OnSetSplitMode        func(mode string)
@@ -75,6 +76,10 @@ func (c *Controller) dispatch(command Command) {
 	case ActionReconnect:
 		if c.actions.OnReconnect != nil {
 			c.actions.OnReconnect()
+		}
+	case ActionSelectSite:
+		if c.actions.OnSelectSite != nil && command.Value != nil {
+			c.actions.OnSelectSite(*command.Value)
 		}
 	case ActionCodexMode:
 		if c.actions.OnCodexMode != nil {

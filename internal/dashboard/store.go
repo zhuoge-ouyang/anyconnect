@@ -18,6 +18,7 @@ type Action string
 const (
 	ActionDisconnect          Action = "disconnect"
 	ActionReconnect           Action = "reconnect"
+	ActionSelectSite          Action = "select_site"
 	ActionCodexMode           Action = "codex_mode"
 	ActionRestoreNormal       Action = "restore_normal"
 	ActionSetSplitMode        Action = "set_split_mode"
@@ -37,6 +38,8 @@ const (
 )
 
 type Snapshot struct {
+	Sites               []string  `json:"sites"`
+	ConnectionBusy      bool      `json:"connection_busy"`
 	StatusText          string    `json:"status_text"`
 	CurrentSite         string    `json:"current_site"`
 	SplitTunnelEnabled  bool      `json:"split_tunnel_enabled"`
@@ -193,7 +196,7 @@ func (c Command) Validate() error {
 			return fmt.Errorf("%s command has unsupported value %q", c.Action, *c.Value)
 		}
 		return nil
-	case ActionAddForeignDomain, ActionAddForeignCIDR, ActionRemoveForeignDomain, ActionRemoveForeignCIDR:
+	case ActionSelectSite, ActionAddForeignDomain, ActionAddForeignCIDR, ActionRemoveForeignDomain, ActionRemoveForeignCIDR:
 		if c.Value == nil || strings.TrimSpace(*c.Value) == "" {
 			return fmt.Errorf("%s command requires value", c.Action)
 		}

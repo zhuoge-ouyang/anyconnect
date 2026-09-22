@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory=$true)][string]$OutputPath,
-    [string]$Version = '1.0.4.0',
+    [string]$Version = '1.0.5.0',
     [string]$Publisher = ''
 )
 $ErrorActionPreference = 'Stop'
@@ -28,7 +28,7 @@ $manifestPath = Join-Path $outDir 'ui-host.manifest'
 $manifest = [IO.File]::ReadAllText((Join-Path $source 'app.manifest')).Replace('version="1.0.0.0"', ('version="'+$Version+'"'))
 [IO.File]::WriteAllText($manifestPath,$manifest,(New-Object Text.UTF8Encoding($false)))
 $arguments = @('/nologo','/target:winexe','/platform:x64','/optimize+','/utf8output',('/out:'+$OutputPath),('/win32manifest:'+$manifestPath),('/win32icon:'+(Join-Path $root 'internal\tray\app.ico')),
-    '/reference:System.dll','/reference:System.Core.dll','/reference:System.Drawing.dll','/reference:System.Windows.Forms.dll','/reference:System.Web.Extensions.dll',
+    '/reference:System.dll','/reference:System.Core.dll','/reference:System.Drawing.dll','/reference:System.Windows.Forms.dll','/reference:System.Windows.Forms.DataVisualization.dll','/reference:System.Web.Extensions.dll',
     ('/resource:'+(Join-Path $source 'Recharge.txt')+',Recharge.txt'), $assemblyPath)
 $arguments += @(Get-ChildItem -LiteralPath $source -Filter '*.cs' -File | ForEach-Object {$_.FullName})
 Invoke-ReleaseCommand $compiler $arguments

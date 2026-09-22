@@ -643,6 +643,7 @@ func main() {
 		log.Printf("Failed to read smart-selection transaction: %v", txErr)
 	}
 	dashboardStore := dashboard.NewStore(dataDir)
+	var manualConnectionBusy atomic.Bool
 	smartUI := newSmartRuntime()
 	dashboardController := dashboard.NewController(dashboardStore, dashboard.Actions{})
 	dashboardBackend := func() string { return "" }
@@ -657,6 +658,7 @@ func main() {
 			backend = "未连接"
 		}
 		snapshot := dashboard.Snapshot{
+			ConnectionBusy:      manualConnectionBusy.Load(),
 			StatusText:          status.StatusText,
 			CurrentSite:         status.CurrentSite,
 			SplitTunnelEnabled:  status.SplitEnabled,
@@ -674,6 +676,9 @@ func main() {
 			LastError:           status.LastError,
 			ForeignDomains:      append([]string(nil), cfg.ForeignDomains...),
 			ForeignCIDRs:        append([]string(nil), cfg.ForeignCIDRs...),
+		}
+		for _, site := range cfg.VPNSites {
+			snapshot.Sites = append(snapshot.Sites, site.Name)
 		}
 		smart := smartUI.snapshot()
 		snapshot.SmartState, snapshot.SmartMessage, snapshot.SmartResultID = smart.SmartState, smart.SmartMessage, smart.SmartResultID
@@ -1628,6 +1633,9 @@ func main() {
 
 	actions := tray.Actions{
 		OnDisconnect: func() error {
+			if manualConnectionBusy.Load() {
+				return nil
+			}
 			if smartUI.isRunning() {
 				trayUI.SetStatusBusy("智能选线进行中，请先取消")
 				return nil
@@ -1639,15 +1647,28 @@ func main() {
 			return err
 		},
 		OnReconnect: func() {
+			if !modeSwitchMu.TryLock() {
+				return
+			}
+			defer modeSwitchMu.Unlock()
+			if !manualConnectionBusy.CompareAndSwap(false, true) {
+				return
+			}
+			defer func() { manualConnectionBusy.Store(false); publishDashboard(trayUI.Snapshot()) }()
+			publishDashboard(trayUI.Snapshot())
 			if smartUI.isRunning() {
 				trayUI.SetStatusBusy("智能选线进行中，请先取消")
 				return
 			}
 			log.Println("Reconnecting VPN...")
-			disconnectSession("reconnect")
 			selectedSite, username, password, ok := connectionInput(cfg, sites, false)
 			if !ok {
 				log.Println("User cancelled reconnect dialog")
+				return
+			}
+			if err := disconnectSession("reconnect"); err != nil {
+				log.Printf("Reconnect disconnect failed: %v", err)
+				trayUI.SetStatusError("断开失败，已停止重新连接")
 				return
 			}
 			resetRouteOps()
@@ -1670,10 +1691,16 @@ func main() {
 			vpnMon.SetState(monitor.StateConnected)
 		},
 		OnCodexMode: func() {
+			if manualConnectionBusy.Load() {
+				return
+			}
 			log.Println("ChatGPT/Codex smart selection requested")
 			switchToCodexMode()
 		},
 		OnRestoreNormal: func() {
+			if manualConnectionBusy.Load() {
+				return
+			}
 			if smartUI.isRunning() {
 				trayUI.SetStatusBusy("智能选线进行中，请先取消")
 				return
@@ -1682,6 +1709,9 @@ func main() {
 			restoreNormalSite("restore normal")
 		},
 		OnSetSplitMode: func(mode string) {
+			if manualConnectionBusy.Load() {
+				return
+			}
 			if smartUI.isRunning() {
 				trayUI.SetStatusBusy("智能选线进行中，请先取消")
 				return
@@ -1843,6 +1873,43 @@ func main() {
 		},
 		OnReconnect: func() {
 			go actions.OnReconnect()
+		},
+		OnSelectSite: func(name string) {
+			status := trayUI.Snapshot().StatusText
+			if strings.Contains(status, "正在") || strings.Contains(status, "初始化") || strings.Contains(status, "检测中") {
+				return
+			}
+			if !modeSwitchMu.TryLock() {
+				return
+			}
+			if smartUI.isRunning() || !manualConnectionBusy.CompareAndSwap(false, true) {
+				modeSwitchMu.Unlock()
+				return
+			}
+			publishDashboard(trayUI.Snapshot())
+			go func() {
+				defer modeSwitchMu.Unlock()
+				defer func() { manualConnectionBusy.Store(false); publishDashboard(trayUI.Snapshot()) }()
+				state := vpnMon.State()
+				connected := state == monitor.StateActive || state == monitor.StateConnected
+				err := switchSelectedSite(sites, name, connectedSite.Name, connectedUsername, connectedPassword, connected,
+					func() error { return disconnectSession("selected site") },
+					func(site ui.Site, username, password string) error {
+						return connectFinalSite(site, username, password, "selected site")
+					})
+				if err != nil {
+					log.Printf("Site selection failed: %v", err)
+					showErrorDialog("切换站点未完成", err.Error())
+					return
+				}
+				cfg.PreferredSite = name
+				cfg.CodexModeActive = false
+				if err := cfg.Save(); err != nil {
+					log.Printf("Save selected site failed: %v", err)
+					showErrorDialog("线路已切换", "无法保存常用线路，下次启动可能仍使用原设置。")
+				}
+				trayUI.SetCodexModeActive(false)
+			}()
 		},
 		OnCodexMode: func() {
 			actions.OnCodexMode()

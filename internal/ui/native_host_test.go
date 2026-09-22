@@ -74,7 +74,7 @@ func buildTestHost(t *testing.T) (string, string, string) {
 			return
 		}
 		compiler := filepath.Join(os.Getenv("WINDIR"), "Microsoft.NET/Framework64/v4.0.30319/csc.exe")
-		args := []string{"/nologo", "/platform:x64", "/utf8output", "/r:System.dll", "/r:System.Core.dll", "/r:System.Drawing.dll", "/r:System.Windows.Forms.dll", "/r:System.Web.Extensions.dll", "/win32manifest:" + filepath.Join(source, "app.manifest"), "/resource:" + filepath.Join(source, "Recharge.txt") + ",Recharge.txt"}
+		args := []string{"/nologo", "/platform:x64", "/utf8output", "/r:System.dll", "/r:System.Core.dll", "/r:System.Drawing.dll", "/r:System.Windows.Forms.dll", "/r:System.Windows.Forms.DataVisualization.dll", "/r:System.Web.Extensions.dll", "/win32manifest:" + filepath.Join(source, "app.manifest"), "/resource:" + filepath.Join(source, "Recharge.txt") + ",Recharge.txt"}
 		testHost = filepath.Join(testAssets, hostFileName)
 		testHarness = filepath.Join(work, "native-tests.exe")
 		for _, harness := range []bool{false, true} {
@@ -190,6 +190,69 @@ func TestHostMissingDoesNotFallback(t *testing.T) {
 	if _, err := hostCommand("login", map[string]any{}); err == nil {
 		t.Fatal("missing host accepted")
 	}
+}
+
+// Optional release smoke check: exercise the actual extracted host, never the installed VPN process.
+func TestPackagedNativeHostReady(t *testing.T) {
+	host := os.Getenv("ANYCONNECT_PACKAGED_HOST")
+	if host == "" {
+		t.Skip("set ANYCONNECT_PACKAGED_HOST to verify a release binary")
+	}
+	old := nativeHostPath
+	nativeHostPath = func() string { return host }
+	defer func() { nativeHostPath = old }()
+	store := dashboard.NewStore(t.TempDir())
+	if err := store.WriteSnapshot(dashboard.Snapshot{StatusText: "状态：VPN 未连接", Sites: []string{"隔离测试站点"}}); err != nil {
+		t.Fatal(err)
+	}
+	cmd, err := hostCommand("dashboard", map[string]any{"snapshot_path": store.SnapshotPath(), "command_dir": store.CommandDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill() }()
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	ready := make(chan error, 1)
+	go func() {
+		var result struct {
+			Ready bool `json:"ready"`
+		}
+		err := json.NewDecoder(stdout).Decode(&result)
+		if err == nil && !result.Ready {
+			err = fmt.Errorf("host was not ready")
+		}
+		ready <- err
+	}()
+	select {
+	case err = <-ready:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("release host readiness timeout")
+	}
+	time.Sleep(1200 * time.Millisecond)
+	hwnd := dashboardWindowForProcess(cmd.Process.Pid)
+	if hwnd == 0 {
+		t.Fatal("release dashboard missing")
+	}
+	dashboardUser32.NewProc("PostMessageW").Call(hwnd, 0x10, 0, 0)
+	select {
+	case err = <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("release host did not close")
+	}
+	t.Log("packaged host loaded charts, became ready and accepted close; no VPN action sent")
 }
 
 func TestNativeLoginPipeRoundTrip(t *testing.T) {
